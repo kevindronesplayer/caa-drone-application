@@ -45,7 +45,6 @@ const ui = {
   candidates: {},          // asId → { key, list, loading, error }
   caa: { items: [], source: null },
   warnings: {},            // asId → { zones: [], kinks: bool }
-  aiReady: null,
   aiBusy: false,
 };
 
@@ -116,6 +115,87 @@ function toast(msg, type = '') {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// OpenStreetMap 服務（瀏覽器直接呼叫）
+// ═══════════════════════════════════════════════════════════════
+const OVERPASS_URLS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.kumi.systems/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+];
+// 有些地下／立體停車場沒標 parking 類型，只寫在名稱裡
+const INDOOR_PARKING_WORDS = ['地下', '立體', '室內', '大樓', 'B1', 'B2'];
+const overpassCache = new Map();
+
+// 範圍內的公園與戶外停車場；各鏡像站速度時好時壞，同時查詢取最先成功的
+async function queryLaunchCandidates(south, west, north, east) {
+  const key = [south, west, north, east].map((v) => v.toFixed(4)).join(',');
+  if (overpassCache.has(key)) return overpassCache.get(key);
+  const bbox = `${south},${west},${north},${east}`;
+  const query = `[out:json][timeout:25];
+(
+  nwr["leisure"~"^(park|recreation_ground|garden)$"]["access"!~"^(private|no)$"](${bbox});
+  nwr["amenity"="parking"]["parking"!~"^(underground|multi-storey|rooftop)$"]["location"!~"underground"]["access"!~"^(private|no)$"](${bbox});
+);
+out center tags 500;`;
+  const ctrls = OVERPASS_URLS.map(() => new AbortController());
+  const timer = setTimeout(() => ctrls.forEach((c) => c.abort()), 40000);
+  let elements;
+  try {
+    elements = await Promise.any(OVERPASS_URLS.map(async (url, i) => {
+      const res = await fetch(url, { method: 'POST', body: new URLSearchParams({ data: query }), signal: ctrls[i].signal });
+      if (!res.ok) throw new Error(`${res.status}`);
+      return (await res.json()).elements || [];
+    }));
+  } catch {
+    throw new Error('OpenStreetMap 查詢逾時或失敗');
+  } finally {
+    clearTimeout(timer);
+    ctrls.forEach((c) => c.abort());
+  }
+  const list = [];
+  for (const el of elements) {
+    const lat = el.lat ?? el.center?.lat;
+    const lng = el.lon ?? el.center?.lon;
+    if (lat == null || lng == null) continue;
+    const tags = el.tags || {};
+    const kind = tags.amenity === 'parking' ? 'parking' : 'park';
+    let name = tags['name:zh'] || tags.name || '';
+    if (kind === 'parking' && INDOOR_PARKING_WORDS.some((w) => name.includes(w))) continue;
+    const named = Boolean(name);
+    if (!name) name = kind === 'parking' ? '戶外停車場' : '公園綠地';
+    list.push({ id: `${el.type}/${el.id}`, lat, lng, kind, name, named });
+  }
+  overpassCache.set(key, list);
+  return list;
+}
+
+// Nominatim 使用規範：每秒最多 1 次請求，這裡排隊送出
+let nominatimChain = Promise.resolve();
+function nominatim(path, params) {
+  const run = async () => {
+    const url = `https://nominatim.openstreetmap.org/${path}?${new URLSearchParams({ format: 'jsonv2', 'accept-language': 'zh-TW', ...params })}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${res.status}`);
+    return res.json();
+  };
+  const p = nominatimChain.then(run);
+  nominatimChain = p.catch(() => {}).then(() => new Promise((r) => setTimeout(r, 1100)));
+  return p;
+}
+const reverseCache = new Map();
+async function reverseGeocode(lat, lng) {
+  const key = `${lat.toFixed(4)},${lng.toFixed(4)}`;
+  if (reverseCache.has(key)) return reverseCache.get(key);
+  const addr = (await nominatim('reverse', { lat, lon: lng, zoom: 16 })).address || {};
+  const city = addr.city || addr.county || addr.state || '';
+  let town = addr.town || addr.suburb || addr.city_district || addr.village || '';
+  if (town === city) town = '';
+  const result = { area: `${city}${town}`, place: addr.amenity || addr.leisure || addr.road || '' };
+  reverseCache.set(key, result);
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // 地圖
 // ═══════════════════════════════════════════════════════════════
 const map = L.map('map', { zoomControl: true }).setView([23.75, 120.95], 8);
@@ -157,10 +237,20 @@ function classifyZone(props) {
   if (cat.includes('飛航情報限航區') || cat.includes('RCR') || name.includes('RCR')) return 'RCR區域';
   return '其他限制區';
 }
+// 民航局伺服器不允許瀏覽器跨網域讀取，改讀 GitHub Actions 每日更新的檔案；失敗再用內建 RCR 快照
+async function fetchCaaData() {
+  try {
+    const res = await fetch('data/caa_zones.geojson', { cache: 'no-cache' });
+    if (!res.ok) throw new Error(res.statusText);
+    return await res.json();
+  } catch {
+    const res = await fetch('data/rcr_fallback.geojson');
+    return { ...(await res.json()), source: 'fallback' };
+  }
+}
 async function loadCaaZones() {
   try {
-    const res = await fetch('/api/caa-zones');
-    const data = await res.json();
+    const data = await fetchCaaData();
     const groups = { '機場': [], 'RCR區域': [], '其他限制區': [] };
     for (const f of data.features || []) {
       if (!f.geometry) continue;
@@ -192,8 +282,8 @@ async function loadCaaZones() {
       layerControl.addOverlay(layer, `${emoji[type]} 民航局限制區（${type}，${feats.length}筆）`);
     }
     $('#caaStatus').textContent = data.source === 'live'
-      ? `民航局限制區：即時資料 ${data.features.length} 筆（僅供參考，以民航局公告為準）`
-      : `⚠️ 無法連線民航局圖資，改用內建 RCR 離線快照（${data.features.length} 筆）`;
+      ? `民航局限制區：${new Date(data.fetched_at * 1000).toLocaleDateString('zh-TW')} 更新，${data.features.length} 筆（僅供參考，以民航局公告為準）`
+      : `⚠️ 無法載入民航局限制區，改用內建 RCR 離線快照（${data.features.length} 筆）`;
     state.airspaces.forEach(updateWarnings);
     renderPanel();
   } catch (err) {
@@ -461,8 +551,7 @@ function finishCircle(radius) {
 async function fillAreaName(as) {
   try {
     const [lat, lng] = asCenter(as);
-    const res = await fetch(`/api/reverse?lat=${lat}&lng=${lng}`);
-    const j = await res.json();
+    const j = await reverseGeocode(lat, lng);
     if (j.area && !as.area) { as.area = j.area; save(); renderPanel(); }
   } catch { /* 使用者可手動填 */ }
 }
@@ -542,13 +631,8 @@ async function ensureCandidates(as, force = false) {
   const [w, s, e, n] = turf.bbox(asFeature(as));
   const loading = (async () => {
     try {
-      const res = await fetch('/api/launch-candidates', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ south: s, west: w, north: n, east: e }),
-      });
-      const j = await res.json();
-      if (!res.ok) throw new Error(j.error || res.statusText);
-      const list = j.candidates.filter((c) => insideAirspace(as, c.lat, c.lng));
+      const all = await queryLaunchCandidates(s, w, n, e);
+      const list = all.filter((c) => insideAirspace(as, c.lat, c.lng));
       ui.candidates[as.id] = { key, list };
       return list;
     } catch (err) {
@@ -624,8 +708,7 @@ async function autoGenerate(as) {
 async function nameFromReverse(lp) {
   lp.name = '空域內地點';
   try {
-    const res = await fetch(`/api/reverse?lat=${lp.lat}&lng=${lp.lng}`);
-    const j = await res.json();
+    const j = await reverseGeocode(lp.lat, lp.lng);
     if (j.place || j.area) lp.name = j.place ? `${j.place}附近空地` : `${j.area}空地`;
   } catch { /* 保留預設名稱 */ }
   save();
@@ -778,8 +861,31 @@ function insertLaunchIntoOverview() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// AI 擴寫
+// AI 擴寫（使用者自己的 Claude API 金鑰，只存在這個瀏覽器，不會進專案檔）
 // ═══════════════════════════════════════════════════════════════
+const ANTHROPIC_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk/+esm';
+const AI_MODEL = 'claude-opus-5-5';
+const API_KEY_STORAGE = 'caaDroneApp.apiKey';
+const AI_SYSTEM_PROMPT = `你是協助台灣無人機業者撰寫「交通部民用航空局 遙控無人機活動申請」文件的專業文書助理。
+使用者會提供案名、作業大致內容，以及系統自動整理的空域資料。請把大致內容擴寫成一份正式、完整、可直接貼進申請書的「作業概述」。
+
+撰寫要求：
+1. 使用台灣正體中文與公文書常用語氣，條理分明。
+2. 以「一、二、三…」分段，建議包含：作業目的、作業地點及空域範圍、作業期間及時段、飛航高度、作業方式及飛行規劃、人員配置與安全管理措施、緊急應變措施。可依內容增減，但不要灌水。
+3. 只能使用使用者與空域資料中的事實。日期、時段、機型、操作人員證號、保險等未提供的資訊，一律寫成【待確認：項目】佔位，絕對不要自行編造。
+4. 不要寫「預計起飛地點」段落（系統會另外插入）；若已提供起飛點資料，可在作業方式中簡要提及「詳見預計起飛地點」。
+5. 輸出純文字，不要使用 Markdown 符號（#、*、**、- 項目符號、表格），因為內容會直接輸出成 Word。
+6. 直接輸出作業概述本文，不要前言或結語說明。`;
+
+function getApiKey() {
+  try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch { return ''; }
+}
+function setApiKey(key) {
+  try {
+    if (key) localStorage.setItem(API_KEY_STORAGE, key); else localStorage.removeItem(API_KEY_STORAGE);
+  } catch { toast('此瀏覽器無法儲存金鑰（可能是無痕模式）', 'error'); }
+}
+
 function airspaceSummary() {
   return state.airspaces.map((as) => {
     const lines = [`${as.name}`, `  地點：${as.area || '未填'}`];
@@ -795,37 +901,48 @@ function airspaceSummary() {
   }).join('\n');
 }
 async function runAiExpand() {
+  if (!getApiKey()) { toast('請先在上方設定 Claude API 金鑰', 'error'); return; }
   if (!state.draft.trim()) { toast('請先輸入作業大致內容', 'error'); return; }
   if (state.overview.trim() && !confirm('作業概述已有內容，AI 生成會覆蓋（起飛點段落會保留）。確定繼續？')) return;
   const hadLaunch = state.overview.includes(LAUNCH_SECTION_TITLE);
   ui.aiBusy = true;
   renderPanel();
   const ta = () => document.querySelector('[data-field="overview"]');
+  let Anthropic;
   try {
-    const res = await fetch('/api/ai-expand', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ case_name: state.caseName, draft: state.draft, airspace_summary: airspaceSummary() }),
+    ({ default: Anthropic } = await import(ANTHROPIC_SDK_URL));
+    const client = new Anthropic({ apiKey: getApiKey(), dangerouslyAllowBrowser: true });
+    const userMsg = `案名：${state.caseName || '【待確認：案名】'}\n\n作業大致內容：\n${state.draft}\n\n空域資料（系統自動整理）：\n${airspaceSummary() || '（無）'}`;
+    const stream = client.beta.messages.stream({
+      model: AI_MODEL,
+      max_tokens: 16000,
+      system: AI_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMsg }],
+      output_config: { effort: 'medium' },
+      betas: ['server-side-fallback-2026-07-01'],
+      fallbacks: 'default',
     });
-    if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
-      throw new Error(j.error || res.statusText);
-    }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
     let text = '';
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      text += dec.decode(value, { stream: true });
+    stream.on('text', (delta) => {
+      text += delta;
       state.overview = text;
       const el = ta();
       if (el) { el.value = text; el.scrollTop = el.scrollHeight; }
-    }
+    });
+    const final = await stream.finalMessage();
+    if (final.stop_reason === 'refusal') text += '\n\n【AI 拒絕產生此內容，請修改大致內容後再試】';
+    else if (final.stop_reason === 'max_tokens') text += '\n\n【內容過長被截斷】';
     state.overview = text.trim();
     if (hadLaunch && state.launchPoints.length) state.overview = mergeLaunchText(state.overview);
     toast('AI 已完成作業概述，可直接修改', 'ok');
   } catch (err) {
-    toast(`AI 生成失敗：${err.message}`, 'error');
+    let msg = err.message;
+    if (!Anthropic) msg = '無法載入 Claude SDK，請檢查網路連線';
+    else if (err instanceof Anthropic.AuthenticationError) msg = 'API 金鑰無效，請重新設定';
+    else if (err instanceof Anthropic.RateLimitError) msg = '請求太頻繁或額度不足，請稍後再試';
+    else if (err instanceof Anthropic.APIConnectionError) msg = '無法連線 Claude API，請檢查網路';
+    else if (err instanceof Anthropic.APIError) msg = `Claude API 錯誤（${err.status ?? ''}）：${err.message}`;
+    toast(`AI 生成失敗：${msg}`, 'error');
   } finally {
     ui.aiBusy = false;
     save();
@@ -845,6 +962,7 @@ function download(blob, filename) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
+const DOCX_URL = 'https://cdn.jsdelivr.net/npm/docx@9/+esm';
 const safeName = (s) => (s || '未命名案件').replace(/[\\/:*?"<>|]/g, '_');
 const xmlEsc = (s) => String(s ?? '').replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
 function kmlColor(hex, alpha) { // #rrggbb → aabbggrr
@@ -903,12 +1021,29 @@ function exportKml() {
 async function exportWord() {
   if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
   try {
-    const res = await fetch('/api/export-docx', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ case_name: state.caseName, overview: state.overview }),
+    const d = await import(DOCX_URL);
+    const caseName = state.caseName.trim() || '未命名案件';
+    const font = { ascii: '標楷體', eastAsia: '標楷體', hAnsi: '標楷體', cs: '標楷體' };
+    const run = (text, sizePt, bold = false) => new d.TextRun({ text, bold, size: sizePt * 2, font });
+    // 「一、」「【預計起飛地點】」這類段落標題加粗，其餘照原文換行輸出
+    const sectionRe = /^([一二三四五六七八九十]+、|【)/;
+    const body = state.overview.replace(/\r\n/g, '\n').trim().split('\n').map((line) => new d.Paragraph({
+      spacing: { line: 360, after: 0 },
+      children: [run(line, 12, sectionRe.test(line.trim()))],
+    }));
+    const margin = d.convertMillimetersToTwip(25);
+    const doc = new d.Document({
+      sections: [{
+        properties: { page: { margin: { top: margin, bottom: margin, left: margin, right: margin } } },
+        children: [
+          new d.Paragraph({ alignment: d.AlignmentType.CENTER, spacing: { after: 360 }, children: [run(caseName, 18, true)] }),
+          new d.Paragraph({ children: [run('案名：', 14, true), run(caseName, 14)] }),
+          new d.Paragraph({ spacing: { before: 240 }, children: [run('作業概述：', 14, true)] }),
+          ...body,
+        ],
+      }],
     });
-    if (!res.ok) throw new Error(res.statusText);
-    download(await res.blob(), `${safeName(state.caseName)}_作業概述.docx`);
+    download(await d.Packer.toBlob(doc), `${safeName(caseName)}_作業概述.docx`);
   } catch (err) {
     toast(`Word 輸出失敗：${err.message}`, 'error');
   }
@@ -1071,9 +1206,16 @@ function renderStep1() {
 }
 
 function renderStep2() {
-  const aiNote = ui.aiReady === false
-    ? '<div class="notice warn">尚未設定 Claude API 金鑰，AI 擴充無法使用。請在專案資料夾的 <code>.env</code> 檔填入 <code>ANTHROPIC_API_KEY=...</code> 後重新啟動。仍可手動撰寫作業概述。</div>'
-    : '';
+  const hasKey = Boolean(getApiKey());
+  const aiNote = hasKey
+    ? `<details class="notice ok"><summary>✓ 已設定 Claude API 金鑰（只存在這個瀏覽器）</summary>
+         <div class="btn-row" style="margin-top:6px"><button class="btn danger tiny" data-action="api-key-clear">清除金鑰</button></div></details>`
+    : `<div class="notice warn">AI 擴充需要你自己的 Claude API 金鑰（可到 <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> 申請）。
+         金鑰只會存在這個瀏覽器，直接傳給 Claude，不會上傳到其他地方，也不會存進專案檔。沒有金鑰也可以手動撰寫作業概述。
+         <div class="inline" style="margin-top:6px">
+           <input type="password" id="apiKeyInput" placeholder="sk-ant-..." autocomplete="off">
+           <button class="btn small" data-action="api-key-save">儲存</button>
+         </div></div>`;
   return `<div class="panel-body">
     <div>
       <h2>步驟 2　案名與作業概述</h2>
@@ -1323,6 +1465,19 @@ function handleAction(action, data, btn) {
       break;
     case 'lp-insert': insertLaunchIntoOverview(); break;
     case 'ai-expand': runAiExpand(); break;
+    case 'api-key-save': {
+      const key = $('#apiKeyInput')?.value.trim();
+      if (!key) { toast('請輸入金鑰', 'error'); return; }
+      setApiKey(key);
+      renderPanel();
+      toast('金鑰已儲存在這個瀏覽器', 'ok');
+      break;
+    }
+    case 'api-key-clear':
+      setApiKey('');
+      renderPanel();
+      toast('金鑰已清除');
+      break;
     case 'export-kml': exportKml(); break;
     case 'export-word': exportWord(); break;
     case 'copy':
@@ -1346,27 +1501,22 @@ $('#mapSearch').addEventListener('submit', async (e) => {
   const q = $('#mapSearchInput').value.trim();
   if (!q) return;
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
-    const j = await res.json();
-    if (!j.results?.length) { toast('找不到這個地點'); return; }
-    const r = j.results[0];
-    if (r.bbox) map.fitBounds([[r.bbox[0], r.bbox[2]], [r.bbox[1], r.bbox[3]]], { maxZoom: 17 });
-    else map.setView([r.lat, r.lng], 16);
-    toast(r.name);
+    const results = await nominatim('search', { q, limit: 5, countrycodes: 'tw' });
+    if (!results.length) { toast('找不到這個地點'); return; }
+    const r = results[0];
+    const bb = r.boundingbox?.map(Number); // [south, north, west, east]
+    if (bb) map.fitBounds([[bb[0], bb[2]], [bb[1], bb[3]]], { maxZoom: 17 });
+    else map.setView([Number(r.lat), Number(r.lon)], 16);
+    toast(r.display_name);
   } catch (err) { toast(`搜尋失敗：${err.message}`, 'error'); }
 });
 
 // ── 啟動 ──
-(async function init() {
+(function init() {
   save();
   state.airspaces.forEach(updateWarnings);
   renderAirspaces();
   goStep(state.step || 1, true);
   fitAll();
   loadCaaZones();
-  try {
-    const j = await (await fetch('/api/status')).json();
-    ui.aiReady = j.ai_ready;
-    if (state.step === 2) renderPanel();
-  } catch { ui.aiReady = false; }
 })();

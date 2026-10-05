@@ -1,38 +1,8 @@
 # 民航局無人機申請資料填寫系統
 
-本機網頁工具：畫空域 → 案名與作業概述（AI 擴寫）→ 自動找起飛點 → 輸出 Word / KML。
+網頁工具：畫空域 → 案名與作業概述（AI 擴寫）→ 自動找起飛點 → 輸出 Word / KML。
 
-## 下載安裝
-
-需要 Python 3.10 以上。
-
-```bash
-git clone https://github.com/kevindronesplayer/caa-drone-application.git
-cd caa-drone-application
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env
-```
-
-## 啟動
-
-macOS 可雙擊 `啟動系統.command`（第一次會自動安裝套件），瀏覽器會開啟 <http://127.0.0.1:8765>。
-
-或在終端機：
-
-```bash
-.venv/bin/python app.py
-```
-
-## AI 擴寫設定
-
-編輯專案資料夾的 `.env`，填入 Claude API 金鑰後重新啟動：
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-沒有金鑰時其他功能都能用，只是作業概述要手動撰寫。
+**線上使用：<https://kevindronesplayer.github.io/caa-drone-application/>**
 
 ## 流程
 
@@ -43,9 +13,34 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 資料會自動存在瀏覽器；「儲存專案」可下載 .json，之後用「開啟專案」繼續編輯。
 
-## 資料來源
+## AI 擴寫
 
-- 底圖：OpenStreetMap、內政部國土測繪中心
-- 限制區：民航局 dronegis UAV_fs 公開圖資（與 dronemap 筆記本相同來源，連不上時改用內建 RCR 離線快照）；僅供參考，以民航局公告為準
-- 公園／停車場：OpenStreetMap Overpass API
-- 地名：OpenStreetMap Nominatim
+需要使用者自己的 Claude API 金鑰（<https://console.anthropic.com/settings/keys>），在步驟 2 輸入一次即可。
+金鑰只存在使用者自己的瀏覽器，直接傳給 Claude API，不會存進專案檔或上傳到其他地方。沒有金鑰也能手動撰寫作業概述。
+
+## 架構
+
+純靜態網頁（`docs/`），由 GitHub Pages 提供，不需要伺服器：
+
+| 功能 | 做法 |
+|---|---|
+| 底圖 | OpenStreetMap、內政部國土測繪中心 |
+| 民航局限制區 | 民航局 dronegis UAV_fs 公開圖資。民航局伺服器不允許瀏覽器直接讀取，所以由 GitHub Actions（`.github/workflows/update-caa-zones.yml`）每天下載一次存成 `docs/data/caa_zones.geojson`；讀不到時改用內建 RCR 離線快照。僅供參考，以民航局公告為準 |
+| 公園／停車場 | OpenStreetMap Overpass API |
+| 地名、地點搜尋 | OpenStreetMap Nominatim |
+| AI 擴寫 | Claude API（Anthropic TypeScript SDK，瀏覽器直接呼叫） |
+| Word | docx 函式庫，在瀏覽器產生 |
+
+## 本機執行
+
+macOS 可雙擊 `啟動系統.command`，或：
+
+```bash
+cd docs && python3 -m http.server 8765
+```
+
+手動更新限制區資料：
+
+```bash
+python3 scripts/update_caa_zones.py
+```
