@@ -17,16 +17,25 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 // ── 狀態 ──────────────────────────────────────────────────────
 function newState() {
   return {
-    version: 1, step: 1, caseName: '', draft: '', overview: '',
-    coordFormat: 'dms', includeLaunchInKml: false,
+    version: 2, step: 1, caseName: '', draft: '', overview: '',
+    coordFormat: 'decimal', includeLaunchInKml: false,
     airspaces: [], launchPoints: [], seq: 1, asSeq: 1,
   };
 }
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? { ...newState(), ...JSON.parse(raw) } : null;
+    return raw ? migrate({ ...newState(), ...JSON.parse(raw) }) : null;
   } catch { return null; }
+}
+// v2：座標預設改十進位、取消「最大高度」欄位
+function migrate(s) {
+  if ((s.version || 1) < 2) {
+    s.coordFormat = 'decimal';
+    s.airspaces.forEach((as) => delete as.height);
+    s.version = 2;
+  }
+  return s;
 }
 let state = loadState() || newState();
 function save() {
@@ -45,6 +54,7 @@ const ui = {
   candidates: {},          // asId → { key, list, loading, error }
   caa: { items: [], source: null },
   warnings: {},            // asId → { zones: [], kinks: bool }
+  airports: {},            // asId → 10 公里內的機場與最近跑道頭距離
   aiBusy: false,
 };
 
@@ -196,6 +206,168 @@ async function reverseGeocode(lat, lng) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// 空域內最大地表高度（AWS Terrain Tiles／Terrarium 編碼，逐像素掃描）
+// ═══════════════════════════════════════════════════════════════
+const TERRAIN_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium';
+const TERRAIN_MAX_ZOOM = 15;
+const terrainTiles = new Map();
+const lng2tx = (lng, z) => ((lng + 180) / 360) * 2 ** z;
+const lat2ty = (lat, z) => { const r = lat * Math.PI / 180; return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** z; };
+const tx2lng = (x, z) => (x / 2 ** z) * 360 - 180;
+const ty2lat = (y, z) => { const n = Math.PI - (2 * Math.PI * y) / 2 ** z; return (180 / Math.PI) * Math.atan(Math.sinh(n)); };
+
+function loadTerrainTile(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  if (!terrainTiles.has(key)) {
+    terrainTiles.set(key, new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        const c = document.createElement('canvas');
+        c.width = c.height = 256;
+        const ctx = c.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+        resolve(ctx.getImageData(0, 0, 256, 256).data);
+      };
+      img.onerror = () => { terrainTiles.delete(key); reject(new Error('地形資料載入失敗')); };
+      img.src = `${TERRAIN_URL}/${key}.png`;
+    }));
+  }
+  return terrainTiles.get(key);
+}
+// 快速點在空域內判斷（逐像素用，turf 太慢）
+function insideTester(as) {
+  if (as.type === 'circle') {
+    const [clat, clng] = as.center;
+    const kx = 111320 * Math.cos(clat * Math.PI / 180);
+    const r2 = as.radius ** 2;
+    return (lat, lng) => ((lng - clng) * kx) ** 2 + ((lat - clat) * 110540) ** 2 <= r2;
+  }
+  const pts = as.points;
+  return (lat, lng) => {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const [yi, xi] = pts[i]; const [yj, xj] = pts[j];
+      if ((yi > lat) !== (yj > lat) && lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  };
+}
+async function computeMaxElevation(as) {
+  const [w, s, e, n] = turf.bbox(asFeature(as));
+  let z = TERRAIN_MAX_ZOOM;
+  const range = (zz) => [Math.floor(lng2tx(w, zz)), Math.floor(lng2tx(e, zz)), Math.floor(lat2ty(n, zz)), Math.floor(lat2ty(s, zz))];
+  while (z > 8) {
+    const [x0, x1, y0, y1] = range(z);
+    if ((x1 - x0 + 1) * (y1 - y0 + 1) <= 16) break;
+    z -= 1;
+  }
+  const [x0, x1, y0, y1] = range(z);
+  const inside = insideTester(as);
+  let best = null;
+  const jobs = [];
+  for (let x = x0; x <= x1; x++) {
+    for (let y = y0; y <= y1; y++) {
+      jobs.push(loadTerrainTile(z, x, y).then((data) => {
+        for (let py = 0; py < 256; py++) {
+          const lat = ty2lat(y + (py + 0.5) / 256, z);
+          if (lat < s || lat > n) continue;
+          for (let px = 0; px < 256; px++) {
+            const lng = tx2lng(x + (px + 0.5) / 256, z);
+            if (lng < w || lng > e || !inside(lat, lng)) continue;
+            const i = (py * 256 + px) * 4;
+            const m = data[i] * 256 + data[i + 1] + data[i + 2] / 256 - 32768;
+            if (!best || m > best.m) best = { m, lat, lng };
+          }
+        }
+      }));
+    }
+  }
+  await Promise.all(jobs);
+  if (!best) { // 空域比一個像素還小：取中心點
+    const [lat, lng] = asCenter(as);
+    const tx = lng2tx(lng, z); const ty = lat2ty(lat, z);
+    const data = await loadTerrainTile(z, Math.floor(tx), Math.floor(ty));
+    const i = (Math.floor((ty % 1) * 256) * 256 + Math.floor((tx % 1) * 256)) * 4;
+    best = { m: data[i] * 256 + data[i + 1] + data[i + 2] / 256 - 32768, lat, lng };
+  }
+  const m = Math.max(0, best.m); // 海面為負值
+  return { key: geomKey(as), m: Math.round(m), ft: Math.round(m * 3.28084), lat: best.lat, lng: best.lng };
+}
+const elevPending = new Map();
+function refreshElevation(as) {
+  const key = geomKey(as);
+  if (as.elev?.key === key || elevPending.get(as.id) === key) return;
+  elevPending.set(as.id, key);
+  computeMaxElevation(as).then((elev) => {
+    if (geomKey(as) !== elev.key) return; // 計算期間空域又被改過
+    as.elev = elev;
+    save();
+    renderElevation();
+    renderPanel();
+  }).catch((err) => {
+    as.elev = { key, error: err.message };
+    renderPanel();
+  }).finally(() => { if (elevPending.get(as.id) === key) elevPending.delete(as.id); });
+}
+function elevationHtml(as) {
+  const ev = as.elev;
+  if (!ev || ev.key !== geomKey(as)) return '<div class="meta"><span class="spinner"></span> 計算空域內最大地表高度…</div>';
+  if (ev.error) return `<div class="meta">⚠️ 最大地表高度計算失敗（${esc(ev.error)}）</div>`;
+  return `<div class="stat">⛰ 空域內最大地表高度：<b>約 ${ev.ft.toLocaleString()} ft</b> <span class="meta">（${ev.m} m，位置 ${esc(fmtCoord([ev.lat, ev.lng]))}）</span></div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 機場跑道頭距離（OurAirports 跑道資料，含內移跑道頭修正）
+// ═══════════════════════════════════════════════════════════════
+const AIRPORT_RANGE_M = 10000;
+const NM = 1852;
+let runwayData = [];
+async function loadRunways() {
+  try {
+    const res = await fetch('data/tw_runways.json');
+    runwayData = (await res.json()).airports || [];
+    state.airspaces.forEach(updateAirports);
+    renderAirportLines();
+    renderPanel();
+  } catch (err) { console.warn('跑道資料載入失敗', err); /* 沒有跑道資料就不顯示機場距離 */ }
+}
+// 空域上離 pt 最近的點（pt 在空域內則為 pt 本身）
+function nearestPointInAirspace(as, lat, lng) {
+  if (insideAirspace(as, lat, lng)) return [lat, lng];
+  if (as.type === 'circle') {
+    const bearing = turf.bearing([as.center[1], as.center[0]], [lng, lat]);
+    const c = turf.destination([as.center[1], as.center[0]], as.radius / 1000, bearing, { units: 'kilometers' }).geometry.coordinates;
+    return [c[1], c[0]];
+  }
+  const p = turf.nearestPointOnLine(turf.polygonToLine(asFeature(as)), [lng, lat]).geometry.coordinates;
+  return [p[1], p[0]];
+}
+function updateAirports(as) {
+  const near = [];
+  for (const ap of runwayData) {
+    let best = null;
+    for (const th of ap.thresholds) {
+      const p = nearestPointInAirspace(as, th.lat, th.lng);
+      const d = distM(p, [th.lat, th.lng]);
+      if (!best || d < best.d) best = { d, th, p };
+    }
+    if (best && best.d <= AIRPORT_RANGE_M) {
+      near.push({ icao: ap.icao, name: ap.name, rwy: best.th.rwy, th: [best.th.lat, best.th.lng], p: best.p, nm: best.d / NM });
+    }
+  }
+  near.sort((a, b) => a.nm - b.nm);
+  ui.airports[as.id] = near;
+}
+function airportHtml(as) {
+  const near = ui.airports[as.id];
+  if (!near?.length) return '';
+  return near.map((a) => `<div class="notice danger">✈️ 位於 <b>${esc(a.name)}</b>（${a.icao}）10 公里內：空域最近點距 <b>RWY ${esc(a.rwy)} 跑道頭 ${a.nm.toFixed(2)} 海里</b>
+    <div class="meta">空域最近點 ${esc(fmtCoord(a.p))}</div></div>`).join('');
+}
+const airportText = (a) => `距${a.name}（${a.icao}）RWY ${a.rwy} 跑道頭 ${a.nm.toFixed(2)} 海里`;
+
+// ═══════════════════════════════════════════════════════════════
 // 地圖
 // ═══════════════════════════════════════════════════════════════
 const map = L.map('map', { zoomControl: true }).setView([23.75, 120.95], 8);
@@ -222,6 +394,8 @@ const editGroup = L.layerGroup().addTo(map);
 const drawGroup = L.layerGroup().addTo(map);
 const candGroup = L.layerGroup().addTo(map);
 const launchGroup = L.layerGroup().addTo(map);
+const elevGroup = L.layerGroup().addTo(map);
+const airportGroup = L.layerGroup().addTo(map);
 const layerControl = L.control.layers(baseLayers, {}, { collapsed: true }).addTo(map);
 layerControl.addOverlay(candGroup, '🌳 起飛點候選（公園／戶外停車場）');
 L.control.scale({ imperial: false }).addTo(map);
@@ -330,7 +504,7 @@ function renderAirspaces() {
     const style = { color: as.color, weight: selected ? 3.5 : 2, fillColor: as.color, fillOpacity: selected ? 0.22 : 0.15, pane: 'airspace' };
     if (as.type === 'polygon' && as.points.length < 3) return;
     const shape = as.type === 'circle' ? L.circle(as.center, { radius: as.radius, ...style }) : L.polygon(as.points, style);
-    shape.bindTooltip(`${as.name}｜${as.height} 公尺`, { sticky: true });
+    shape.bindTooltip(as.name, { sticky: true });
     shape.on('click', (e) => {
       if (ui.mode !== 'none') return;
       if (state.step === 1 || state.step === 4) {
@@ -342,6 +516,35 @@ function renderAirspaces() {
     shapeById[as.id] = shape;
   });
   renderEditHandles();
+  renderElevation();
+  renderAirportLines();
+}
+
+// 最高點標記
+function renderElevation() {
+  elevGroup.clearLayers();
+  state.airspaces.forEach((as) => {
+    const ev = as.elev;
+    if (!ev || ev.error || ev.key !== geomKey(as)) return;
+    L.marker([ev.lat, ev.lng], {
+      icon: L.divIcon({ className: '', html: '<div class="peak-icon">▲</div>', iconSize: [0, 0] }),
+      interactive: true, keyboard: false,
+    }).bindTooltip(`${as.name} 最大地表高度 約 ${ev.ft.toLocaleString()} ft（${ev.m} m）`, { direction: 'top' }).addTo(elevGroup);
+  });
+}
+// 空域最近點 → 跑道頭的距離線
+function renderAirportLines() {
+  airportGroup.clearLayers();
+  state.airspaces.forEach((as) => {
+    (ui.airports[as.id] || []).forEach((a) => {
+      L.polyline([a.p, a.th], { color: '#c62828', weight: 2, dashArray: '6,5', interactive: false })
+        .bindTooltip(`${a.nm.toFixed(2)} NM`, { permanent: true, direction: 'center', className: 'dist-label' })
+        .addTo(airportGroup);
+      L.circleMarker(a.th, { radius: 5, color: '#c62828', fillColor: '#fff', fillOpacity: 1, weight: 2 })
+        .bindTooltip(`${a.name} RWY ${a.rwy} 跑道頭`, { direction: 'top' })
+        .addTo(airportGroup);
+    });
+  });
 }
 
 const vtxIcon = L.divIcon({ className: '', html: '<div class="vtx-icon"></div>', iconSize: [0, 0] });
@@ -432,8 +635,14 @@ function deleteVertex(as, idx) {
   commitAirspaceEdit(as);
 }
 
-function commitAirspaceEdit(as) {
+// 空域幾何變動後重算：限制區重疊、機場距離、最大地表高度
+function refreshDerived(as) {
   updateWarnings(as);
+  updateAirports(as);
+  refreshElevation(as);
+}
+function commitAirspaceEdit(as) {
+  refreshDerived(as);
   save();
   renderAirspaces();
   renderLaunch();
@@ -528,11 +737,11 @@ function renderDraw() {
 function newAirspace(fields) {
   const n = state.asSeq++;
   const as = {
-    id: uid('as'), name: `空域${n}`, area: '', height: 120,
+    id: uid('as'), name: `空域${n}`, area: '',
     color: AS_COLORS[(n - 1) % AS_COLORS.length], ...fields,
   };
   state.airspaces.push(as);
-  updateWarnings(as);
+  refreshDerived(as);
   save();
   fillAreaName(as);
   cancelMode();
@@ -548,6 +757,125 @@ function finishCircle(radius) {
   if (radius < 10) { toast('半徑太小（至少 10 公尺）', 'error'); return; }
   newAirspace({ type: 'circle', center: ui.draw.center, radius: Math.round(radius) });
 }
+// ── 匯入 KML / KMZ ──
+const JSZIP_URL = 'https://cdn.jsdelivr.net/npm/jszip@3/+esm';
+const kmlEls = (node, name) => [...node.getElementsByTagNameNS('*', name)];
+const kmlChild = (node, name) => [...node.children].find((c) => c.localName === name);
+
+async function readKmlText(file) {
+  if (!/\.kmz$/i.test(file.name)) return file.text();
+  const { default: JSZip } = await import(JSZIP_URL);
+  const zip = await JSZip.loadAsync(file);
+  const entry = Object.values(zip.files).find((f) => /\.kml$/i.test(f.name));
+  if (!entry) throw new Error('KMZ 內找不到 KML 檔');
+  return entry.async('string');
+}
+function parseKmlCoords(text) {
+  const pts = [];
+  for (const t of text.trim().split(/\s+/)) {
+    const [lng, lat] = t.split(',').map(Number);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) pts.push([lat, lng]);
+  }
+  return pts;
+}
+function kmlExtendedData(pm) {
+  const data = {};
+  kmlEls(pm, 'Data').forEach((d) => { data[d.getAttribute('name')] = kmlChild(d, 'value')?.textContent.trim() ?? ''; });
+  kmlEls(pm, 'SimpleData').forEach((d) => { data[d.getAttribute('name')] = d.textContent.trim(); });
+  return data;
+}
+// 逐一移除「與相鄰兩點圍成面積最小」的頂點，直到剩 max 點（保留原始頂點，不產生新點）
+function simplifyRing(pts, max) {
+  const ring = pts.slice();
+  const kx = Math.cos(asCenterOfPoints(ring)[0] * Math.PI / 180);
+  const area = (a, b, c) => Math.abs((b[1] - a[1]) * kx * (c[0] - a[0]) - (c[1] - a[1]) * kx * (b[0] - a[0]));
+  while (ring.length > max) {
+    let minI = 0; let minA = Infinity;
+    ring.forEach((p, i) => {
+      const a = area(ring[(i - 1 + ring.length) % ring.length], p, ring[(i + 1) % ring.length]);
+      if (a < minA) { minA = a; minI = i; }
+    });
+    ring.splice(minI, 1);
+  }
+  return ring;
+}
+const asCenterOfPoints = (pts) => [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+// 外環轉成空域：本系統輸出的圓形或看起來是圓的多邊形 → 圓形；超過 6 點 → 簡化
+function ringToAirspace(ringIn, meta) {
+  const ring = [];
+  for (const p of ringIn) {
+    const last = ring[ring.length - 1];
+    if (!last || distM(last, p) > 0.5) ring.push(p);
+  }
+  if (ring.length > 1 && distM(ring[0], ring[ring.length - 1]) <= 0.5) ring.pop();
+  if (ring.length < 3) return null;
+  const center = asCenterOfPoints(ring);
+  const radii = ring.map((p) => distM(center, p));
+  const meanR = radii.reduce((s, r) => s + r, 0) / radii.length;
+  const isCircle = (meta['形狀'] === '圓形' && Number(meta['半徑_公尺']) > 0)
+    || (ring.length >= 16 && Math.max(...radii.map((r) => Math.abs(r - meanR))) / meanR < 0.02);
+  if (isCircle) {
+    return { airspace: { type: 'circle', center, radius: Math.round(Number(meta['半徑_公尺']) || meanR) } };
+  }
+  if (ring.length <= MAX_POLY_POINTS) return { airspace: { type: 'polygon', points: ring } };
+  return { airspace: { type: 'polygon', points: simplifyRing(ring, MAX_POLY_POINTS) }, simplifiedFrom: ring.length };
+}
+async function importKmlFile(file) {
+  let doc;
+  try {
+    doc = new DOMParser().parseFromString(await readKmlText(file), 'application/xml');
+    if (doc.getElementsByTagName('parsererror').length) throw new Error('檔案格式錯誤');
+  } catch (err) { toast(`無法讀取 ${file.name}：${err.message}`, 'error'); return; }
+
+  if (ui.mode !== 'none') cancelMode();
+  const added = []; const notes = []; const points = [];
+  for (const pm of kmlEls(doc, 'Placemark')) {
+    const name = kmlChild(pm, 'name')?.textContent.trim() || '';
+    const meta = kmlExtendedData(pm);
+    const polys = kmlEls(pm, 'Polygon');
+    polys.forEach((poly, k) => {
+      const outer = kmlEls(poly, 'outerBoundaryIs')[0] || poly;
+      const coords = kmlEls(outer, 'coordinates')[0];
+      const res = coords && ringToAirspace(parseKmlCoords(coords.textContent), meta);
+      if (!res) return;
+      const n = state.asSeq++;
+      const label = name ? (polys.length > 1 ? `${name}-${k + 1}` : name) : `空域${n}`;
+      const as = {
+        id: uid('as'), name: label, area: meta['地點'] || '',
+        color: AS_COLORS[(n - 1) % AS_COLORS.length], ...res.airspace,
+      };
+      state.airspaces.push(as);
+      added.push(as);
+      if (res.simplifiedFrom) notes.push(`「${label}」原有 ${res.simplifiedFrom} 點，已簡化為 ${MAX_POLY_POINTS} 點，請確認形狀`);
+    });
+    // 本系統匯出的起飛點（名稱「起飛點 1-1 …」或在「預計起飛地點」資料夾內）
+    const folder = pm.parentElement?.localName === 'Folder' ? kmlChild(pm.parentElement, 'name')?.textContent || '' : '';
+    if (!polys.length && (name.startsWith('起飛點') || folder.includes('起飛'))) {
+      const c = kmlEls(pm, 'Point')[0] && kmlEls(kmlEls(pm, 'Point')[0], 'coordinates')[0];
+      const pt = c && parseKmlCoords(c.textContent)[0];
+      if (pt) points.push({ lat: pt[0], lng: pt[1], name: name.replace(/^起飛點\s*\d+-\d+\s*/, '').trim() });
+    }
+  }
+  if (!added.length) { toast(`${file.name} 裡沒有找到多邊形空域`, 'error'); return; }
+
+  let lpCount = 0;
+  for (const p of points) {
+    const as = added.find((a) => insideAirspace(a, p.lat, p.lng));
+    if (!as) continue;
+    state.launchPoints.push({ id: uid('lp'), airspaceId: as.id, lat: p.lat, lng: p.lng, name: p.name || '空域內地點', kind: 'manual' });
+    lpCount += 1;
+  }
+  added.forEach((as) => { refreshDerived(as); if (!as.area) fillAreaName(as); });
+  ui.selectedAirspaceId = added[0].id;
+  save();
+  renderAirspaces();
+  renderLaunch();
+  renderPanel();
+  map.fitBounds(L.featureGroup(added.map((a) => shapeById[a.id]).filter(Boolean)).getBounds(), { padding: [50, 50], maxZoom: 17 });
+  toast(`已匯入 ${added.length} 個空域${lpCount ? `、${lpCount} 個起飛點` : ''}，可直接拖曳修改`, 'ok');
+  notes.forEach((m) => toast(m, 'error'));
+}
+
 async function fillAreaName(as) {
   try {
     const [lat, lng] = asCenter(as);
@@ -892,7 +1220,8 @@ function airspaceSummary() {
     if (as.type === 'circle') lines.push(`  範圍：圓形，圓心 ${fmtCoord(as.center)}，半徑 ${Math.round(as.radius)} 公尺`);
     else lines.push(`  範圍：多邊形 ${as.points.length} 點，頂點 ${as.points.map(fmtCoord).join('；')}`);
     lines.push(`  面積：約 ${(asArea(as) / 1e4).toFixed(2)} 公頃`);
-    lines.push(`  飛航高度：距地面 ${as.height} 公尺（約 ${ft(as.height)} 呎）以下`);
+    if (as.elev?.ft != null && as.elev.key === geomKey(as)) lines.push(`  空域內最大地表高度：約 ${as.elev.ft} 英尺（${as.elev.m} 公尺）`);
+    (ui.airports[as.id] || []).forEach((a) => lines.push(`  鄰近機場：空域最近點${airportText(a)}`));
     const w = ui.warnings[as.id];
     if (w?.zones.length) lines.push(`  與民航局公告限制區重疊：${w.zones.join('、')}`);
     const pts = lpsOf(as.id);
@@ -979,9 +1308,10 @@ function buildKml(includeLaunch) {
     const coords = ccw.map(([lng, lat]) => `${lng.toFixed(7)},${lat.toFixed(7)},0`).join(' ');
     const desc = [
       `地點：${as.area || ''}`,
-      `高度：${as.height} 公尺（約 ${ft(as.height)} 呎）`,
+      as.elev?.ft != null ? `最大地表高度：約 ${as.elev.ft} ft（${as.elev.m} m）` : '',
+      ...(ui.airports[as.id] || []).map((a) => `空域最近點${airportText(a)}`),
       as.type === 'circle' ? `圓形：圓心 ${fmtCoord(as.center)}，半徑 ${Math.round(as.radius)} 公尺` : `多邊形頂點：${as.points.map(fmtCoord).join('；')}`,
-    ].join('<br>');
+    ].filter(Boolean).join('<br>');
     return `
     <Placemark>
       <name>${xmlEsc(as.name)}</name>
@@ -989,7 +1319,7 @@ function buildKml(includeLaunch) {
       <styleUrl>#as${i}</styleUrl>
       <ExtendedData>
         <Data name="地點"><value>${xmlEsc(as.area)}</value></Data>
-        <Data name="高度_公尺"><value>${xmlEsc(as.height)}</value></Data>
+        ${as.elev?.ft != null ? `<Data name="最大地表高度_ft"><value>${as.elev.ft}</value></Data>` : ''}
         <Data name="形狀"><value>${as.type === 'circle' ? '圓形' : '多邊形'}</value></Data>
         ${as.type === 'circle' ? `<Data name="半徑_公尺"><value>${Math.round(as.radius)}</value></Data>` : ''}
         <Data name="CKWT座標"><value>${xmlEsc(ckwtList(as))}</value></Data>
@@ -1057,7 +1387,7 @@ function openProject(file) {
     try {
       const data = JSON.parse(reader.result);
       if (!Array.isArray(data.airspaces)) throw new Error('格式不符');
-      state = { ...newState(), ...data };
+      state = migrate({ ...newState(), version: 1, ...data });
       resetView();
       toast('專案已開啟', 'ok');
     } catch (err) { toast(`無法開啟專案檔：${err.message}`, 'error'); }
@@ -1067,9 +1397,10 @@ function openProject(file) {
 function resetView() {
   ui.candidates = {};
   ui.warnings = {};
+  ui.airports = {};
   ui.selectedAirspaceId = null;
   ui.selectedLaunchId = null;
-  state.airspaces.forEach(updateWarnings);
+  state.airspaces.forEach(refreshDerived);
   save();
   cancelMode();
   goStep(state.step || 1, true);
@@ -1157,6 +1488,8 @@ function airspaceInfoHtml(as) {
          <div class="meta">圓心 <span class="coord">${esc(fmtCoord(as.center))}</span></div>`
       : `<div class="meta">多邊形 ${as.points.length}/${MAX_POLY_POINTS} 點</div>`}
     <div class="meta">面積約 ${(area / 1e4).toFixed(2)} 公頃（${Math.round(area).toLocaleString()} m²）</div>
+    ${elevationHtml(as)}
+    ${airportHtml(as)}
     ${w.kinks ? '<div class="notice danger">⚠️ 多邊形邊線交錯，請拖曳頂點修正</div>' : ''}
     ${w.zones.length ? `<details class="notice warn"><summary>⚠️ 與 ${w.zones.length} 處民航局公告限制區重疊（點開查看）</summary>${w.zones.map(esc).join('<br>')}</details>` : ''}`;
 }
@@ -1170,10 +1503,7 @@ function renderStep1() {
         <span class="swatch" style="background:${as.color}"></span>
         <input type="text" data-as-field="name" data-id="${as.id}" value="${esc(as.name)}">
       </div>
-      <div class="grid2">
-        <label class="field">地點<input type="text" data-as-field="area" data-id="${as.id}" value="${esc(as.area)}" placeholder="自動帶入縣市鄉鎮"></label>
-        <label class="field">最大高度（公尺）<input type="number" min="1" data-as-field="height" data-id="${as.id}" value="${esc(as.height)}"><small>約 ${ft(as.height)} 呎</small></label>
-      </div>
+      <label class="field">地點<input type="text" data-as-field="area" data-id="${as.id}" value="${esc(as.area)}" placeholder="自動帶入縣市鄉鎮"></label>
       ${airspaceInfoHtml(as)}
       <div class="btn-row">
         <button class="btn ghost small" data-action="as-select" data-id="${as.id}">${as.id === ui.selectedAirspaceId ? '✏️ 編輯中' : '✏️ 選取編輯'}</button>
@@ -1184,11 +1514,12 @@ function renderStep1() {
   return `<div class="panel-body">
     <div>
       <h2>步驟 1　繪製作業空域</h2>
-      <p class="lead">在地圖上畫出申請的飛航空域，可畫多個。多邊形最多 ${MAX_POLY_POINTS} 個點；選取後可直接拖曳頂點、點虛線圓點新增頂點、點頂點刪除。</p>
+      <p class="lead">在地圖上畫出申請的飛航空域，或匯入 KML（也可把檔案拖到地圖上），可有多個。多邊形最多 ${MAX_POLY_POINTS} 個點；選取後可直接拖曳頂點、點虛線圓點新增頂點、點頂點刪除。</p>
     </div>
     <div class="btn-row">
       <button class="btn ${ui.mode === 'drawPolygon' ? 'active' : ''}" data-action="draw-polygon">⬠ 畫多邊形</button>
       <button class="btn ${ui.mode === 'drawCircle' ? 'active' : ''}" data-action="draw-circle">◯ 畫圓形</button>
+      <button class="btn ghost" data-action="kml-import" title="匯入 KML／KMZ 檔，也可以直接把檔案拖到地圖上">📂 匯入 KML</button>
       ${drawing ? '<button class="btn ghost" data-action="mode-cancel">取消</button>' : ''}
     </div>
     ${ui.mode === 'drawPolygon' ? `<div class="notice info">已點 <b>${n}/${MAX_POLY_POINTS}</b> 點。點回第一點、雙擊或按「完成」結束。
@@ -1318,10 +1649,7 @@ function renderStep4() {
         <input type="text" data-as-field="name" data-id="${as.id}" value="${esc(as.name)}">
         <button class="btn ghost tiny" data-action="as-select" data-id="${as.id}" title="在地圖上編輯形狀">✏️</button>
       </div>
-      <div class="grid2">
-        <label class="field">地點<input type="text" data-as-field="area" data-id="${as.id}" value="${esc(as.area)}"></label>
-        <label class="field">最大高度（公尺）<input type="number" min="1" data-as-field="height" data-id="${as.id}" value="${esc(as.height)}"><small>約 ${ft(as.height)} 呎</small></label>
-      </div>
+      <label class="field">地點<input type="text" data-as-field="area" data-id="${as.id}" value="${esc(as.area)}"></label>
       ${airspaceInfoHtml(as)}
       <div class="meta">CKWT 座標${as.type === 'circle' ? '（圓心）' : ''}：</div>
       <div class="inline"><input type="text" class="coord" readonly value="${esc(ckwtList(as))}"><button class="btn ghost tiny" data-action="copy" data-text="${esc(ckwtList(as))}">複製</button></div>
@@ -1369,11 +1697,7 @@ panelEl.addEventListener('input', (e) => {
     const as = getAs(t.dataset.id);
     if (!as) return;
     const f = t.dataset.asField;
-    if (f === 'height') {
-      as.height = Number(t.value) || 0;
-      const small = t.parentElement.querySelector('small');
-      if (small) small.textContent = `約 ${ft(as.height)} 呎`;
-    } else if (f === 'radius') {
+    if (f === 'radius') {
       const r = Number(t.value);
       if (r >= 10) { as.radius = r; shapeById[as.id]?.setRadius(r); renderEditHandles(); }
     } else {
@@ -1409,6 +1733,22 @@ $('#stepper').addEventListener('click', (e) => {
 document.querySelector('.top-actions').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-action]');
   if (btn) handleAction(btn.dataset.action, btn.dataset, btn);
+});
+$('#kmlFile').addEventListener('change', async (e) => {
+  for (const f of e.target.files) await importKmlFile(f);
+  e.target.value = '';
+});
+// 把 KML／KMZ 拖到地圖上即可匯入
+const mapWrap = $('.map-wrap');
+mapWrap.addEventListener('dragover', (e) => { e.preventDefault(); mapWrap.classList.add('drop-hover'); });
+mapWrap.addEventListener('dragleave', () => mapWrap.classList.remove('drop-hover'));
+mapWrap.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  mapWrap.classList.remove('drop-hover');
+  const files = [...e.dataTransfer.files].filter((f) => /\.km[lz]$/i.test(f.name));
+  if (!files.length) { toast('請拖入 .kml 或 .kmz 檔', 'error'); return; }
+  if (state.step !== 1) goStep(1);
+  for (const f of files) await importKmlFile(f);
 });
 $('#projectFile').addEventListener('change', (e) => {
   if (e.target.files[0]) openProject(e.target.files[0]);
@@ -1490,6 +1830,7 @@ function handleAction(action, data, btn) {
       map.setView([23.75, 120.95], 8);
       break;
     case 'project-open': $('#projectFile').click(); break;
+    case 'kml-import': $('#kmlFile').click(); break;
     case 'project-save': saveProject(); break;
     default: break;
   }
@@ -1514,9 +1855,10 @@ $('#mapSearch').addEventListener('submit', async (e) => {
 // ── 啟動 ──
 (function init() {
   save();
-  state.airspaces.forEach(updateWarnings);
+  state.airspaces.forEach(refreshDerived);
   renderAirspaces();
   goStep(state.step || 1, true);
   fitAll();
   loadCaaZones();
+  loadRunways();
 })();

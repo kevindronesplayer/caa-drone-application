@@ -1,4 +1,4 @@
-name: 更新民航局限制區
+name: 更新民航局限制區與跑道資料
 
 on:
   schedule:
@@ -18,14 +18,16 @@ jobs:
           python-version: '3.12'
       - name: 下載限制區
         run: python3 scripts/update_caa_zones.py
+      - name: 更新機場跑道頭
+        run: python3 scripts/build_runways.py || echo '跑道資料下載失敗，沿用舊檔'
       - name: 有變更才提交
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add docs/data/caa_zones.geojson
+          git add docs/data/caa_zones.geojson docs/data/tw_runways.json
           if git diff --cached --quiet; then
             echo '資料沒有變動'
           else
-            git commit -m '自動更新民航局限制區資料'
+            git commit -m '自動更新民航局限制區與跑道資料'
             git push
           fi
