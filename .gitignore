@@ -1,0 +1,7 @@
+# 金鑰與本機環境（不要上傳）
+.env
+.venv/
+.claude/
+__pycache__/
+*.pyc
+.DS_Store

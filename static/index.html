@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>無人機申請填寫系統</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">🚁</span>
+      <div>
+        <div class="brand-title">民航局無人機申請資料填寫系統</div>
+        <div class="brand-sub" id="caseLabel">未命名案件</div>
+      </div>
+    </div>
+    <nav class="stepper" id="stepper">
+      <button data-step="1"><span>1</span>繪製空域</button>
+      <button data-step="2"><span>2</span>案名與作業概述</button>
+      <button data-step="3"><span>3</span>預計起飛地點</button>
+      <button data-step="4"><span>4</span>確認與輸出</button>
+    </nav>
+    <div class="top-actions">
+      <button class="btn ghost" data-action="project-new" title="清除目前資料，開新案件">開新案件</button>
+      <button class="btn ghost" data-action="project-open" title="開啟先前儲存的專案檔 (.json)">開啟專案</button>
+      <button class="btn ghost" data-action="project-save" title="下載專案檔 (.json)，可之後再開啟繼續編輯">儲存專案</button>
+      <input type="file" id="projectFile" accept=".json,application/json" hidden>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="map-wrap">
+      <div id="map"></div>
+      <form class="map-search" id="mapSearch">
+        <input type="search" id="mapSearchInput" placeholder="搜尋地點（例：宜蘭運動公園）" autocomplete="off">
+        <button type="submit" class="btn small">搜尋</button>
+      </form>
+      <div class="map-hint" id="mapHint" hidden></div>
+      <div class="caa-status" id="caaStatus">民航局限制區載入中…</div>
+    </section>
+    <aside class="panel" id="panel"></aside>
+  </main>
+
+  <div class="toasts" id="toasts"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
