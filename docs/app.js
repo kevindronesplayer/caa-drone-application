@@ -6,7 +6,7 @@
 
 const MAX_POLY_POINTS = 6;
 const STORAGE_KEY = 'caaDroneApp.v1';
-const AS_COLORS = ['#1565c0', '#7b1fa2', '#00897b', '#ef6c00', '#c2185b', '#5d4037', '#283593', '#2e7d32'];
+const AS_COLOR = '#7b1fa2'; // 所有空域統一紫色
 const LAUNCH_SECTION_TITLE = '【預計起飛地點】';
 // 作業概述格式：第一段 →【預計起飛地點】→ 結語；第一段預設為範本
 const DEFAULT_INTRO = '本案係辦理「XX」紀錄片，受XX委託，(拍攝規劃與內容)。因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。';
@@ -391,6 +391,19 @@ function elevationHtml(as) {
 // 機場跑道頭距離（OurAirports 跑道資料，含內移跑道頭修正）
 // ═══════════════════════════════════════════════════════════════
 const AIRPORT_RANGE_M = 10000;
+// 民航局公告的「機場四周禁止施放範圍」與「機場四周距地面或水面200呎以上禁止施放範圍」→ 機場代碼
+const CAA_AIRPORT_ZONES = [
+  ['臺北松山', 'RCSS'], ['臺灣桃園', 'RCTP'], ['臺中清泉崗', 'RCMQ'], ['嘉義機場', 'RCKU'], ['臺南機場', 'RCNN'],
+  ['高雄國際', 'RCKH'], ['恆春機場', 'RCKW'], ['臺東豐年', 'RCFN'], ['花蓮機場', 'RCYU'], ['澎湖機場', 'RCQC'],
+  ['望安機場', 'RCWA'], ['七美機場', 'RCCM'], ['金門機場', 'RCBS'], ['馬祖南竿', 'RCFG'], ['馬祖北竿', 'RCMT'],
+  ['綠島機場', 'RCGI'], ['蘭嶼機場', 'RCLY'],
+];
+const AIRPORT_NAME = { RCCM: '七美機場' }; // 沒有跑道座標的機場，只顯示「位於範圍內」
+function caaZoneAirport(props) {
+  if (!(props?.['空域類別名稱'] || '').startsWith('機場四周')) return null;
+  const name = props['空域名稱'] || '';
+  return CAA_AIRPORT_ZONES.find(([key]) => name.startsWith(key))?.[1] || null;
+}
 const NM = 1852;
 let runwayData = [];
 async function loadRunways() {
@@ -413,7 +426,9 @@ function nearestPointInAirspace(as, lat, lng) {
   const p = turf.nearestPointOnLine(turf.polygonToLine(asFeature(as)), [lng, lat]).geometry.coordinates;
   return [p[1], p[0]];
 }
+// 在機場範圍內 = 碰到民航局公告的機場範圍，或距跑道頭 10 公里內；每座機場各算最近跑道頭距離
 function updateAirports(as) {
+  const zoneIcaos = ui.warnings[as.id]?.airportIcaos || new Set();
   const near = [];
   for (const ap of runwayData) {
     let best = null;
@@ -422,11 +437,16 @@ function updateAirports(as) {
       const d = distM(p, [th.lat, th.lng]);
       if (!best || d < best.d) best = { d, th, p };
     }
-    if (best && best.d <= AIRPORT_RANGE_M) {
-      near.push({ icao: ap.icao, name: ap.name, rwy: best.th.rwy, th: [best.th.lat, best.th.lng], p: best.p, nm: best.d / NM });
+    const inZone = zoneIcaos.has(ap.icao);
+    if (best && (inZone || best.d <= AIRPORT_RANGE_M)) {
+      near.push({ icao: ap.icao, name: ap.name, rwy: best.th.rwy, th: [best.th.lat, best.th.lng], p: best.p, nm: best.d / NM, inZone });
     }
   }
   near.sort((a, b) => a.nm - b.nm);
+  // 範圍內但沒有跑道座標的機場（例：七美）
+  zoneIcaos.forEach((icao) => {
+    if (!runwayData.some((ap) => ap.icao === icao)) near.push({ icao, name: AIRPORT_NAME[icao] || icao, nm: null, inZone: true });
+  });
   ui.airports[as.id] = near;
 }
 const APPROACH_NM = 3;
@@ -436,9 +456,13 @@ const inApproach = (a) => Number(a.nm.toFixed(2)) <= APPROACH_NM;
 function airportHtml(as) {
   const near = ui.airports[as.id];
   if (!near?.length) return '';
-  return near.map((a) => `<div class="notice danger">✈️ 位於 <b>${esc(a.name)}</b>（${a.icao}）10 公里內：空域最近點距 <b>RWY ${esc(a.rwy)} 跑道頭 ${fmtNm(a)}</b>
-    ${inApproach(a) ? `<div class="approach">⚠️ 受${esc(a.name)}近離場影響</div>` : ''}
-    <div class="meta">空域最近點 ${esc(fmtCoord(a.p))}</div></div>`).join('');
+  return near.map((a) => {
+    const where = a.inZone ? '機場範圍內（民航局公告）' : '跑道頭 10 公里內';
+    if (a.nm == null) return `<div class="notice danger">✈️ 位於 <b>${esc(a.name)}</b>（${a.icao}）${where}<div class="meta">此機場沒有跑道頭座標資料，無法計算距離</div></div>`;
+    return `<div class="notice danger">✈️ 位於 <b>${esc(a.name)}</b>（${a.icao}）${where}：空域最近點距 <b>RWY ${esc(a.rwy)} 跑道頭 ${fmtNm(a)}</b>
+      ${inApproach(a) ? `<div class="approach">⚠️ 受${esc(a.name)}近離場影響</div>` : ''}
+      <div class="meta">空域最近點 ${esc(fmtCoord(a.p))}</div></div>`;
+  }).join('');
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -598,7 +622,8 @@ async function loadCaaZones() {
     $('#caaStatus').textContent = data.source === 'live'
       ? `民航局限制區：${new Date(data.fetched_at * 1000).toLocaleDateString('zh-TW')} 更新，${data.features.length} 筆（僅供參考，以民航局公告為準）`
       : `⚠️ 無法載入民航局限制區，改用內建 RCR 離線快照（${data.features.length} 筆）`;
-    state.airspaces.forEach(updateWarnings);
+    state.airspaces.forEach((as) => { updateWarnings(as); updateAirports(as); });
+    renderAirportLines();
     renderPanel();
   } catch (err) {
     $('#caaStatus').textContent = `⚠️ 民航局限制區載入失敗：${err.message}`;
@@ -612,7 +637,7 @@ function fmtCaaDate(v) {
 function setCaaInteractive(on) { map.getPane('caa').style.pointerEvents = on ? '' : 'none'; }
 
 function updateWarnings(as) {
-  const w = { zones: [], kinks: false };
+  const w = { zones: [], kinks: false, airportIcaos: new Set() };
   if (as.type === 'polygon' && as.points.length >= 4) {
     try { w.kinks = turf.kinks(asFeature(as)).features.length > 0; } catch { /* ignore */ }
   }
@@ -628,6 +653,8 @@ function updateWarnings(as) {
           const p = it.feature.properties || {};
           const label = `${p['空域名稱'] || '限制區'}${p['空域顏色'] ? `（${p['空域顏色']}）` : ''}`;
           if (!seen.has(label)) { seen.add(label); w.zones.push(label); }
+          const icao = caaZoneAirport(p);
+          if (icao) w.airportIcaos.add(icao);
         }
       } catch { /* 幾何異常略過 */ }
     }
@@ -641,7 +668,7 @@ function renderAirspaces() {
   for (const k of Object.keys(shapeById)) delete shapeById[k];
   state.airspaces.forEach((as) => {
     const selected = as.id === ui.selectedAirspaceId;
-    const style = { color: as.color, weight: selected ? 3.5 : 2, fillColor: as.color, fillOpacity: selected ? 0.22 : 0.15, pane: 'airspace' };
+    const style = { color: AS_COLOR, weight: selected ? 3.5 : 2, fillColor: AS_COLOR, fillOpacity: selected ? 0.22 : 0.15, pane: 'airspace' };
     if (as.type === 'polygon' && as.points.length < 3) return;
     const shape = as.type === 'circle' ? L.circle(as.center, { radius: as.radius, ...style }) : L.polygon(as.points, style);
     shape.bindTooltip(as.name, { sticky: true });
@@ -676,7 +703,7 @@ function renderElevation() {
 function renderAirportLines() {
   airportGroup.clearLayers();
   state.airspaces.forEach((as) => {
-    (ui.airports[as.id] || []).forEach((a) => {
+    (ui.airports[as.id] || []).filter((a) => a.nm != null).forEach((a) => {
       L.polyline([a.p, a.th], { color: '#c62828', weight: 2, dashArray: '6,5', interactive: false })
         .bindTooltip(`${a.nm.toFixed(2)} NM（${(a.nm * NM / 1000).toFixed(2)} km）`, { permanent: true, direction: 'center', className: 'dist-label' })
         .addTo(airportGroup);
@@ -877,10 +904,9 @@ function renderDraw() {
   }
 }
 function newAirspace(fields) {
-  const n = state.asSeq++;
   const as = {
     id: uid('as'), name: `空域${state.airspaces.length + 1}`, area: '',
-    color: AS_COLORS[(n - 1) % AS_COLORS.length], ...fields,
+    ...fields,
   };
   state.airspaces.push(as);
   refreshDerived(as);
@@ -981,11 +1007,10 @@ async function importKmlFile(file) {
       const coords = kmlEls(outer, 'coordinates')[0];
       const res = coords && ringToAirspace(parseKmlCoords(coords.textContent), meta);
       if (!res) return;
-      const n = state.asSeq++;
       const label = name ? (polys.length > 1 ? `${name}-${k + 1}` : name) : `空域${state.airspaces.length + 1}`;
       const as = {
         id: uid('as'), name: label, area: meta['地點'] || '',
-        color: AS_COLORS[(n - 1) % AS_COLORS.length], ...res.airspace,
+        ...res.airspace,
       };
       state.airspaces.push(as);
       added.push(as);
@@ -1122,19 +1147,45 @@ async function ensureCandidates(as, force = false) {
   return loading;
 }
 
-// 空域內的幾何備援點：多邊形各頂點往中心內縮、圓形 16 方位 85% 半徑
+// 起飛點離空域邊緣至少 20%：相對位置（0 = 中心、1 = 邊緣）不超過 0.6；備援點放在 0.5（約 25%）
+const LAUNCH_MAX_REL = 0.6;
+const LAUNCH_FALLBACK_REL = 0.5;
+// 點在空域內的相對位置：中心到該點的距離 ÷ 中心沿同方向到邊緣的距離
+function relPos(as, lat, lng) {
+  if (as.type === 'circle') return distM(as.center, [lat, lng]) / as.radius;
+  const c = asCenter(as);
+  const kx = Math.cos(c[0] * Math.PI / 180);
+  const local = (p) => [(p[1] - c[1]) * kx, p[0] - c[0]];
+  const [px, py] = local([lat, lng]);
+  const len = Math.hypot(px, py);
+  if (!len) return 0;
+  const dx = px / len; const dy = py / len;
+  let edge = Infinity; // 射線與各邊的最近交點
+  as.points.forEach((a, i) => {
+    const [ax, ay] = local(a);
+    const [bx, by] = local(as.points[(i + 1) % as.points.length]);
+    const ex = bx - ax; const ey = by - ay;
+    const den = dx * ey - dy * ex;
+    if (Math.abs(den) < 1e-15) return;
+    const t = (ax * ey - ay * ex) / den;
+    const u = (ax * dy - ay * dx) / den;
+    if (t > 0 && u >= 0 && u <= 1) edge = Math.min(edge, t);
+  });
+  return edge === Infinity ? 1 : len / edge;
+}
+// 空域內的幾何備援點：多邊形各頂點往中心內縮一半、圓形 16 方位半徑一半
 function geometricPoints(as) {
   if (as.type === 'circle') {
     const pts = [];
     for (let b = 0; b < 360; b += 22.5) {
-      const d = turf.destination([as.center[1], as.center[0]], as.radius * 0.85 / 1000, b, { units: 'kilometers' }).geometry.coordinates;
+      const d = turf.destination([as.center[1], as.center[0]], as.radius * LAUNCH_FALLBACK_REL / 1000, b, { units: 'kilometers' }).geometry.coordinates;
       pts.push([d[1], d[0]]);
     }
     return pts;
   }
   const c = asCenter(as);
   return as.points.map((v) => {
-    for (const t of [0.12, 0.25, 0.4, 0.6]) {
+    for (const t of [1 - LAUNCH_FALLBACK_REL, 0.6, 0.7]) {
       const p = [v[0] + (c[0] - v[0]) * t, v[1] + (c[1] - v[1]) * t];
       if (insideAirspace(as, ...p)) return p;
     }
@@ -1151,15 +1202,17 @@ function farthestPair(items, pos, weight = () => 1) {
   }
   return best;
 }
-// 自動挑 2 個起飛點：候選地點中距離最遠的一對（有名稱的優先）；不足則用對角線幾何點補
+// 自動挑 2 個起飛點：離邊緣 20% 以上的候選地點中距離最遠的一對（有名稱的優先）；不足則用對角線幾何點補
 function pickLaunchSites(as, candidates) {
   const geo = geometricPoints(as).map((p) => ({ lat: p[0], lng: p[1], name: '', kind: 'manual' }));
   const pos = (c) => [c.lat, c.lng];
   const toLp = (c) => ({ lat: c.lat, lng: c.lng, name: candidateName(c), kind: c.kind });
   const farthestFrom = (c, list) => list.reduce((a, b) => (distM(pos(b), pos(c)) > distM(pos(a), pos(c)) ? b : a));
   const weight = (c) => (c.named ? 1 : 0.85);
+  // 太靠近空域邊緣（外圍 20%）的候選點不選
+  const usable = candidates.filter((c) => relPos(as, c.lat, c.lng) <= LAUNCH_MAX_REL);
   // 依優先順序：公園／戶外停車場 → 廟宇 → 空域對角線幾何點
-  const tiers = [candidates.filter((c) => c.kind !== 'temple'), candidates.filter((c) => c.kind === 'temple'), geo];
+  const tiers = [usable.filter((c) => c.kind !== 'temple'), usable.filter((c) => c.kind === 'temple'), geo];
   for (let t = 0; t < tiers.length; t++) {
     const list = tiers[t];
     if (list.length >= 2) return farthestPair(list, pos, weight).map(toLp);
@@ -1256,7 +1309,7 @@ function renderLaunch() {
     const label = launchLabel(lp);
     const outside = !insideAirspace(as, lp.lat, lp.lng);
     const m = L.marker([lp.lat, lp.lng], {
-      icon: launchIcon(label, as.color, lp.id === ui.selectedLaunchId, outside),
+      icon: launchIcon(label, AS_COLOR, lp.id === ui.selectedLaunchId, outside),
       draggable: editable, zIndexOffset: 800,
     });
     m.bindTooltip(`${esc(lp.name || '')}${outside ? '（在空域外！）' : ''}`, { permanent: true, direction: 'right', offset: [8, -18], className: 'lp-label' });
@@ -1461,7 +1514,7 @@ function kmlColor(hex, alpha) { // #rrggbb → aabbggrr
 }
 function buildKml(airspaces, docName) {
   const styles = airspaces.map((as, i) => `
-    <Style id="as${i}"><LineStyle><color>${kmlColor(as.color, 'ff')}</color><width>2.5</width></LineStyle><PolyStyle><color>${kmlColor(as.color, '55')}</color></PolyStyle></Style>`).join('');
+    <Style id="as${i}"><LineStyle><color>${kmlColor(AS_COLOR, 'ff')}</color><width>2.5</width></LineStyle><PolyStyle><color>${kmlColor(AS_COLOR, '55')}</color></PolyStyle></Style>`).join('');
   const placemarks = airspaces.map((as, i) => {
     const ring = asFeature(as).geometry.coordinates[0];
     // KML 外環建議逆時針
@@ -1690,7 +1743,7 @@ function renderStep1() {
   const cards = state.airspaces.map((as) => `
     <div class="card ${as.id === ui.selectedAirspaceId ? 'selected' : ''}" data-card="${as.id}">
       <div class="card-head">
-        <span class="swatch" style="background:${as.color}"></span>
+        <span class="swatch" style="background:${AS_COLOR}"></span>
         <input type="text" data-as-field="name" data-id="${as.id}" value="${esc(as.name)}">
       </div>
       <label class="field">地點<input type="text" data-as-field="area" data-id="${as.id}" value="${esc(as.area)}" placeholder="自動帶入縣市鄉鎮"></label>
@@ -1781,7 +1834,7 @@ function launchRowsHtml(as, compact = false) {
     const outside = !insideAirspace(as, lp.lat, lp.lng);
     const sel = lp.id === ui.selectedLaunchId;
     return `<div class="lp-row ${sel ? 'selected' : ''} ${outside ? 'outside' : ''}" data-lp-row="${lp.id}">
-      <span class="lp-badge" style="background:${as.color}">${launchLabel(lp)}</span>
+      <span class="lp-badge" style="background:${AS_COLOR}">${launchLabel(lp)}</span>
       <div>
         <input type="text" data-lp-field="name" data-id="${lp.id}" value="${esc(lp.name)}">
         <div class="meta"><span class="tag ${lp.kind}">${kindLabel[lp.kind] || '自訂'}</span> <span class="coord">${esc(fmtCoord([lp.lat, lp.lng]))}</span>
@@ -1803,7 +1856,7 @@ function renderStep3() {
       : `空域內找到 ${c.list.filter((x) => x.kind === 'park').length} 處公園、${c.list.filter((x) => x.kind === 'parking').length} 處戶外停車場、${c.list.filter((x) => x.kind === 'temple').length} 處廟宇`;
     const adding = ui.mode === 'addLaunch' && ui.addFor === as.id;
     return `<div class="card" data-card="${as.id}">
-      <div class="card-head"><span class="swatch" style="background:${as.color}"></span><b>${esc(as.name)}</b><span class="meta">${esc(as.area)}</span></div>
+      <div class="card-head"><span class="swatch" style="background:${AS_COLOR}"></span><b>${esc(as.name)}</b><span class="meta">${esc(as.area)}</span></div>
       <div class="meta">${status}</div>
       ${launchRowsHtml(as)}
       <div class="btn-row">
@@ -1817,7 +1870,7 @@ function renderStep3() {
   return `<div class="panel-body">
     <div>
       <h2>步驟 3　預計起飛地點</h2>
-      <p class="lead">每個空域自動產生 2 個起飛點：優先挑空域內<b>相距最遠</b>的公園或戶外停車場，不足時用廟宇，再不足才用空域對角線位置。
+      <p class="lead">每個空域自動產生 2 個起飛點：優先挑空域內<b>相距最遠</b>的公園或戶外停車場（離空域邊緣至少 20%），不足時用廟宇，再不足才用空域對角線上離邊緣約 25% 的位置。
       點選地圖上的起飛點後，再點新位置或候選點（🌳公園／P停車場／廟）即可修改，也可直接拖曳（拖到候選點旁會自動吸附）。</p>
     </div>
     ${ui.mode === 'moveLaunch' ? `<div class="notice info">正在移動起飛點 <b>${launchLabel(getLp(ui.selectedLaunchId) || {})}</b>：點選空域內新位置或候選點。<button class="btn ghost tiny" data-action="mode-cancel">取消</button></div>` : ''}
@@ -1842,7 +1895,7 @@ function renderStep4() {
   const asCards = state.airspaces.map((as) => `
     <div class="card ${as.id === ui.selectedAirspaceId ? 'selected' : ''}" data-card="${as.id}">
       <div class="card-head">
-        <span class="swatch" style="background:${as.color}"></span>
+        <span class="swatch" style="background:${AS_COLOR}"></span>
         <input type="text" data-as-field="name" data-id="${as.id}" value="${esc(as.name)}">
         <button class="btn ghost tiny" data-action="as-select" data-id="${as.id}" title="在地圖上編輯形狀">✏️</button>
       </div>
