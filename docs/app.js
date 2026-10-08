@@ -11,6 +11,7 @@ const LAUNCH_SECTION_TITLE = '【預計起飛地點】';
 // 作業概述格式：第一段 →【預計起飛地點】→ 結語；第一段預設為範本
 const DEFAULT_INTRO = '本案係辦理「XX」紀錄片，受XX委託，(拍攝規劃與內容)。因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。';
 const CLOSING_LINE = '將遵循所有規定並加強安全控管';
+const CLOSING_RE = /^\s*將遵循所有規定並加強安全控管\s*[。.]?\s*$/;
 const DEFAULT_OVERVIEW = `${DEFAULT_INTRO}\n${CLOSING_LINE}`;
 const CAA_COLOR = { '紅區': '#c62828', '黃區': '#f9a825', '灰區': '#757575' };
 const AIRFIELD_KEYWORDS = ['機場', '飛行場', '航空技術學院', '飛行訓練指揮部'];
@@ -50,6 +51,7 @@ function migrate(s) {
     delete s.includeLaunchInKml;
     s.version = 4;
   }
+  s.overview = ensureClosing(s.overview || ''); // 結語一定在最後一行
   return s;
 }
 let state = loadState() || newState();
@@ -1325,13 +1327,18 @@ function buildLaunchText() {
 }
 // 起飛點段落 = 標題行，加上後面「以：結尾的空域行」或「全形空白開頭的起飛點行」
 const LAUNCH_BLOCK_RE = /【預計起飛地點】[^\n]*(?:\n(?:　[^\n]*|[^\n]*：[ \t]*))*/;
+// 結語永遠是最後一行：移除其他位置的結語行，再補在最後
+function ensureClosing(overview) {
+  const lines = overview.replace(/\r\n/g, '\n').split('\n').filter((l) => !CLOSING_RE.test(l));
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  return [...lines, CLOSING_LINE].join('\n');
+}
 function mergeLaunchText(overview) {
   const block = buildLaunchText();
-  if (LAUNCH_BLOCK_RE.test(overview)) return overview.replace(LAUNCH_BLOCK_RE, block);
-  const text = overview.trimEnd();
-  const idx = text.lastIndexOf(CLOSING_LINE);
-  if (idx >= 0) return `${text.slice(0, idx).trimEnd()}\n${block}\n${text.slice(idx)}`;
-  return text ? `${text}\n${block}\n${CLOSING_LINE}` : `${block}\n${CLOSING_LINE}`;
+  if (LAUNCH_BLOCK_RE.test(overview)) return ensureClosing(overview.replace(LAUNCH_BLOCK_RE, block));
+  const text = ensureClosing(overview);
+  const before = text.slice(0, text.lastIndexOf(CLOSING_LINE)).trimEnd();
+  return `${before ? `${before}\n` : ''}${block}\n${CLOSING_LINE}`;
 }
 // 第一段 = 起飛點段落（或結語）之前的文字
 function introEnd(overview) {
@@ -1343,7 +1350,7 @@ function introEnd(overview) {
 const extractIntro = (overview) => overview.slice(0, introEnd(overview)).trim();
 function replaceIntro(overview, intro) {
   const rest = overview.slice(introEnd(overview)).trim();
-  return `${intro.trim()}\n${rest || CLOSING_LINE}`;
+  return ensureClosing(`${intro.trim()}\n${rest}`);
 }
 function insertLaunchIntoOverview() {
   if (!state.launchPoints.length) { toast('目前沒有起飛點', 'error'); return; }
@@ -1505,7 +1512,8 @@ function exportPdf() {
   if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
   const caseName = state.caseName.trim() || '未命名案件';
   const fileTitle = `${safeName(caseName)}_作業概述`;
-  const body = state.overview.replace(/\r\n/g, '\n').trim().split('\n')
+  state.overview = ensureClosing(state.overview);
+  const body = state.overview.trim().split('\n')
     .map((line) => `<p class="${DOC_SECTION_RE.test(line.trim()) ? 'sec' : ''}">${esc(line) || '&nbsp;'}</p>`).join('');
   const html = `<!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><title>${esc(fileTitle)}</title><style>
     @page { size: A4; margin: 25mm; }
@@ -1536,7 +1544,8 @@ async function exportWord() {
     const font = { ascii: '標楷體', eastAsia: '標楷體', hAnsi: '標楷體', cs: '標楷體' };
     const run = (text, sizePt, bold = false) => new d.TextRun({ text, bold, size: sizePt * 2, font });
     // 「一、」「【預計起飛地點】」這類段落標題加粗，其餘照原文換行輸出
-    const body = state.overview.replace(/\r\n/g, '\n').trim().split('\n').map((line) => new d.Paragraph({
+    state.overview = ensureClosing(state.overview);
+    const body = state.overview.trim().split('\n').map((line) => new d.Paragraph({
       spacing: { line: 360, after: 0 },
       children: [run(line, 12, DOC_SECTION_RE.test(line.trim()))],
     }));
@@ -1600,17 +1609,13 @@ function goStep(n, force = false) {
   state.step = n;
   ui.selectedLaunchId = null;
   if (n !== 1 && n !== 4) ui.selectedAirspaceId = null;
+  state.overview = n === 4 && state.launchPoints.length ? mergeLaunchText(state.overview) : ensureClosing(state.overview);
   save();
   renderAirspaces();
   renderLaunch();
   renderCandidates();
   renderPanel();
   $('#panel').scrollTop = 0;
-  if (n === 4 && state.launchPoints.length) {
-    state.overview = mergeLaunchText(state.overview);
-    save();
-    renderPanel();
-  }
   if (n === 3) {
     state.airspaces.forEach((as) => {
       if (!lpsOf(as.id).length) autoGenerate(as);
@@ -1923,6 +1928,12 @@ panelEl.addEventListener('input', (e) => {
 });
 panelEl.addEventListener('change', (e) => {
   const t = e.target;
+  if (t.dataset.field === 'overview') {
+    state.overview = ensureClosing(state.overview);
+    t.value = state.overview;
+    save();
+    return;
+  }
   if (t.dataset.asField) {
     const as = getAs(t.dataset.id);
     if (!as) return;
