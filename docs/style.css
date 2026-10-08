@@ -240,3 +240,6 @@ details.notice[open] summary { margin-bottom: 4px; }
 .tag.temple { background: #fbe9e7; color: #bf360c; }
 .case-options { flex-wrap: wrap; gap: 10px; margin-top: -6px; font-size: 13px; }
 .case-options input[type=checkbox] { width: auto; }
+.panel-footer .btn-row { flex-wrap: nowrap; }
+.leaflet-tooltip.lp-label { background: rgba(255,255,255,.92); border: 1px solid #b0bec5; box-shadow: none; padding: 1px 6px; font-size: 12px; font-weight: 600; color: #102a43; }
+.leaflet-tooltip.lp-label::before { display: none; }

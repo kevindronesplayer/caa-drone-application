@@ -8,6 +8,10 @@ const MAX_POLY_POINTS = 6;
 const STORAGE_KEY = 'caaDroneApp.v1';
 const AS_COLORS = ['#1565c0', '#7b1fa2', '#00897b', '#ef6c00', '#c2185b', '#5d4037', '#283593', '#2e7d32'];
 const LAUNCH_SECTION_TITLE = '【預計起飛地點】';
+// 作業概述格式：第一段 →【預計起飛地點】→ 結語；第一段預設為範本
+const DEFAULT_INTRO = '本案係辦理「XX」紀錄片，受XX委託，(拍攝規劃與內容)。因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。';
+const CLOSING_LINE = '將遵循所有規定並加強安全控管';
+const DEFAULT_OVERVIEW = `${DEFAULT_INTRO}\n${CLOSING_LINE}`;
 const CAA_COLOR = { '紅區': '#c62828', '黃區': '#f9a825', '灰區': '#757575' };
 const AIRFIELD_KEYWORDS = ['機場', '飛行場', '航空技術學院', '飛行訓練指揮部'];
 
@@ -17,8 +21,8 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 // ── 狀態 ──────────────────────────────────────────────────────
 function newState() {
   return {
-    version: 3, step: 1, caseName: '', caseNameAuto: true, highAltitude: false, draft: '', overview: '',
-    coordFormat: 'decimal', includeLaunchInKml: false,
+    version: 4, step: 1, caseName: '', caseNameAuto: true, highAltitude: false, overview: DEFAULT_OVERVIEW,
+    coordFormat: 'decimal',
     airspaces: [], launchPoints: [], seq: 1, asSeq: 1,
   };
 }
@@ -39,6 +43,12 @@ function migrate(s) {
     s.caseNameAuto = !s.caseName;
     s.highAltitude = false;
     s.version = 3;
+  }
+  if (s.version < 4) { // v4：作業大致內容併入作業概述（預設範本）、KML 不含起飛點
+    if (!s.overview.trim()) s.overview = DEFAULT_OVERVIEW;
+    delete s.draft;
+    delete s.includeLaunchInKml;
+    s.version = 4;
   }
   return s;
 }
@@ -253,7 +263,7 @@ async function reverseGeocode(lat, lng) {
   const city = addr.city || addr.county || addr.state || '';
   let town = addr.town || addr.suburb || addr.city_district || addr.village || '';
   if (town === city) town = '';
-  const result = { area: `${city}${town}`, place: addr.amenity || addr.leisure || addr.road || '' };
+  const result = { area: `${city}${town}`, place: addr.amenity || addr.leisure || addr.road || '', road: addr.road || '' };
   reverseCache.set(key, result);
   return result;
 }
@@ -350,7 +360,7 @@ async function computeMaxElevation(as) {
 const ELEV_VERSION = 2; // v2：英尺改為無條件進位
 const MIN_HEIGHT_MARGIN_FT = 400;
 const elevReady = (as) => as.elev && !as.elev.error && as.elev.v === ELEV_VERSION && as.elev.key === geomKey(as);
-const minApplyFt = (as) => as.elev.ft + MIN_HEIGHT_MARGIN_FT;
+const minApplyFt = (as) => Math.ceil((as.elev.ft + MIN_HEIGHT_MARGIN_FT) / 100) * 100;
 const elevPending = new Map();
 function refreshElevation(as) {
   const key = geomKey(as);
@@ -372,7 +382,7 @@ function elevationHtml(as) {
   if (ev?.error && ev.key === geomKey(as)) return `<div class="meta">⚠️ 最大地表高度計算失敗（${esc(ev.error)}）</div>`;
   if (!elevReady(as)) return '<div class="meta"><span class="spinner"></span> 計算空域內最大地表高度…</div>';
   return `<div class="stat">⛰ 空域內最大地表高度：<b>${ev.ft.toLocaleString()} ft</b> <span class="meta">（${ev.m} m，位置 ${esc(fmtCoord([ev.lat, ev.lng]))}）</span></div>
-    <div class="stat">🛫 最低可申請高度：<b>${minApplyFt(as).toLocaleString()} ft</b> <span class="meta">（最大地表高度無條件進位 + ${MIN_HEIGHT_MARGIN_FT} ft）</span></div>`;
+    <div class="stat">🛫 最低可申請高度：<b>${minApplyFt(as).toLocaleString()} ft</b> <span class="meta">（最大地表高度 + ${MIN_HEIGHT_MARGIN_FT} ft，無條件進位到百位）</span></div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1143,7 +1153,7 @@ function farthestPair(items, pos, weight = () => 1) {
 function pickLaunchSites(as, candidates) {
   const geo = geometricPoints(as).map((p) => ({ lat: p[0], lng: p[1], name: '', kind: 'manual' }));
   const pos = (c) => [c.lat, c.lng];
-  const toLp = (c) => ({ lat: c.lat, lng: c.lng, name: c.name, kind: c.kind });
+  const toLp = (c) => ({ lat: c.lat, lng: c.lng, name: candidateName(c), kind: c.kind });
   const farthestFrom = (c, list) => list.reduce((a, b) => (distM(pos(b), pos(c)) > distM(pos(a), pos(c)) ? b : a));
   const weight = (c) => (c.named ? 1 : 0.85);
   // 依優先順序：公園／戶外停車場 → 廟宇 → 空域對角線幾何點
@@ -1171,11 +1181,16 @@ async function autoGenerate(as) {
   renderLaunch();
   renderPanel();
 }
+// 沒有名稱的地點用附近路名命名，例：民權路旁停車場
+const KIND_WORD = { parking: '停車場', park: '公園綠地', temple: '廟宇', manual: '空地' };
+const KIND_FALLBACK = { parking: '戶外停車場', park: '公園綠地', temple: '廟宇', manual: '空域內地點' };
 async function nameFromReverse(lp) {
-  lp.name = '空域內地點';
+  const word = KIND_WORD[lp.kind] || '空地';
+  lp.name = KIND_FALLBACK[lp.kind] || '空域內地點';
   try {
     const j = await reverseGeocode(lp.lat, lp.lng);
-    if (j.place || j.area) lp.name = j.place ? `${j.place}附近空地` : `${j.area}空地`;
+    const base = j.road || j.place || j.area;
+    if (base) lp.name = `${base}旁${word}`;
   } catch { /* 保留預設名稱 */ }
   save();
   renderLaunch();
@@ -1191,13 +1206,12 @@ function snapToCandidate(as, lat, lng) {
   }
   return best;
 }
-function addLaunchPoint(as, { lat, lng, name, kind }) {
+// 候選點沒有名稱（named === false）時名稱留空，交給 nameFromReverse 用路名命名
+const candidateName = (c) => (c.named === false ? '' : c.name || '');
+function addLaunchPoint(as, { lat, lng, name, kind, named }) {
   const snap = name ? null : snapToCandidate(as, lat, lng);
-  const lp = {
-    id: uid('lp'), airspaceId: as.id,
-    lat: snap ? snap.lat : lat, lng: snap ? snap.lng : lng,
-    name: snap ? snap.name : (name || ''), kind: snap ? snap.kind : (kind || 'manual'),
-  };
+  const src = snap || { lat, lng, name, kind: kind || 'manual', named };
+  const lp = { id: uid('lp'), airspaceId: as.id, lat: src.lat, lng: src.lng, name: candidateName(src), kind: src.kind };
   state.launchPoints.push(lp);
   if (!lp.name) nameFromReverse(lp);
   ui.selectedLaunchId = lp.id;
@@ -1206,13 +1220,11 @@ function addLaunchPoint(as, { lat, lng, name, kind }) {
   setMode('none');
   toast(`已新增起飛點 ${launchLabel(lp)}`, 'ok');
 }
-function moveLaunchPoint(lp, { lat, lng, name, kind }) {
+function moveLaunchPoint(lp, { lat, lng, name, kind, named }) {
   const as = getAs(lp.airspaceId);
   const snap = name ? null : snapToCandidate(as, lat, lng);
-  lp.lat = snap ? snap.lat : lat;
-  lp.lng = snap ? snap.lng : lng;
-  lp.kind = snap ? snap.kind : (kind || 'manual');
-  lp.name = snap ? snap.name : (name || '');
+  const src = snap || { lat, lng, name, kind: kind || 'manual', named };
+  Object.assign(lp, { lat: src.lat, lng: src.lng, kind: src.kind, name: candidateName(src) });
   if (!lp.name) nameFromReverse(lp);
   save();
   setMode('none');
@@ -1245,7 +1257,7 @@ function renderLaunch() {
       icon: launchIcon(label, as.color, lp.id === ui.selectedLaunchId, outside),
       draggable: editable, zIndexOffset: 800,
     });
-    m.bindTooltip(`起飛點 ${label}：${lp.name || ''}${outside ? '（在空域外！）' : ''}`, { direction: 'top', offset: [0, -30] });
+    m.bindTooltip(`${esc(lp.name || '')}${outside ? '（在空域外！）' : ''}`, { permanent: true, direction: 'right', offset: [8, -18], className: 'lp-label' });
     m.on('click', (e) => { L.DomEvent.stopPropagation(e); if (editable) selectLaunch(lp.id); });
     m.on('dragend', (e) => {
       const ll = e.target.getLatLng();
@@ -1311,8 +1323,6 @@ function buildLaunchText() {
   });
   return lines.join('\n');
 }
-// 作業概述格式：第一段 →【預計起飛地點】→ 結語
-const CLOSING_LINE = '將遵循所有規定並加強安全控管';
 // 起飛點段落 = 標題行，加上後面「以：結尾的空域行」或「全形空白開頭的起飛點行」
 const LAUNCH_BLOCK_RE = /【預計起飛地點】[^\n]*(?:\n(?:　[^\n]*|[^\n]*：[ \t]*))*/;
 function mergeLaunchText(overview) {
@@ -1323,11 +1333,17 @@ function mergeLaunchText(overview) {
   if (idx >= 0) return `${text.slice(0, idx).trimEnd()}\n${block}\n${text.slice(idx)}`;
   return text ? `${text}\n${block}\n${CLOSING_LINE}` : `${block}\n${CLOSING_LINE}`;
 }
-function composeOverview(intro) {
-  const parts = [intro.trim()];
-  if (state.launchPoints.length) parts.push(buildLaunchText());
-  parts.push(CLOSING_LINE);
-  return parts.join('\n');
+// 第一段 = 起飛點段落（或結語）之前的文字
+function introEnd(overview) {
+  const m = overview.match(LAUNCH_BLOCK_RE);
+  if (m) return m.index;
+  const i = overview.lastIndexOf(CLOSING_LINE);
+  return i >= 0 ? i : overview.length;
+}
+const extractIntro = (overview) => overview.slice(0, introEnd(overview)).trim();
+function replaceIntro(overview, intro) {
+  const rest = overview.slice(introEnd(overview)).trim();
+  return `${intro.trim()}\n${rest || CLOSING_LINE}`;
 }
 function insertLaunchIntoOverview() {
   if (!state.launchPoints.length) { toast('目前沒有起飛點', 'error'); return; }
@@ -1344,13 +1360,13 @@ const ANTHROPIC_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk/+esm';
 const AI_MODEL = 'claude-opus-5-5';
 const API_KEY_STORAGE = 'caaDroneApp.apiKey';
 const AI_SYSTEM_PROMPT = `你是協助台灣無人機業者撰寫「交通部民用航空局 遙控無人機活動申請」作業概述的文書助理。
-請依使用者提供的大致內容，寫出作業概述的第一段。格式固定如下，只輸出這一段：
+使用者會提供作業概述第一段的草稿，請潤飾、擴充後輸出。格式固定如下，只輸出這一段：
 
 本案係辦理「片名」紀錄片，受委託單位委託，拍攝規劃與內容。因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。
 
 規則：
-1. 「片名」、「委託單位」、「拍攝規劃與內容」依大致內容填入。拍攝規劃與內容用一到三句通順的公文語氣，說明拍攝主題、場景與方式，可提及作業地點。
-2. 大致內容沒有提供的資訊（例如片名或委託單位）寫成【待確認：項目】，不要自行編造。
+1. 片名、委託單位照草稿保留。拍攝規劃與內容依草稿改寫成一到三句通順的公文語氣，說明拍攝主題、場景與方式，可提及作業地點。
+2. 草稿中仍是「XX」或「(拍攝規劃與內容)」等未填的部分，寫成【待確認：項目】，不要自行編造。
 3. 最後一句「因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。」照原文保留。
 4. 使用台灣正體中文，只輸出這一段純文字：不要標題、不要換行、不要 Markdown、不要其他說明。`;
 
@@ -1369,8 +1385,9 @@ function airspaceSummary() {
 }
 async function runAiExpand() {
   if (!getApiKey()) { toast('請先在上方設定 Claude API 金鑰', 'error'); return; }
-  if (!state.draft.trim()) { toast('請先輸入作業大致內容', 'error'); return; }
-  if (state.overview.trim() && !confirm('作業概述已有內容，AI 生成會覆蓋（起飛點段落會依最新資料重新放入）。確定繼續？')) return;
+  const draft = extractIntro(state.overview);
+  if (!draft || draft === DEFAULT_INTRO) { toast('請先在作業概述第一段填入片名、委託單位與拍攝內容', 'error'); return; }
+  const original = state.overview;
   ui.aiBusy = true;
   renderPanel();
   const ta = () => document.querySelector('[data-field="overview"]');
@@ -1378,7 +1395,7 @@ async function runAiExpand() {
   try {
     ({ default: Anthropic } = await import(ANTHROPIC_SDK_URL));
     const client = new Anthropic({ apiKey: getApiKey(), dangerouslyAllowBrowser: true });
-    const userMsg = `案名：${state.caseName || '【待確認：案名】'}\n\n作業大致內容：\n${state.draft}\n\n作業地點：\n${airspaceSummary() || '（無）'}`;
+    const userMsg = `第一段草稿：\n${draft}\n\n作業地點：\n${airspaceSummary() || '（無）'}`;
     const stream = client.beta.messages.stream({
       model: AI_MODEL,
       max_tokens: 16000,
@@ -1391,14 +1408,14 @@ async function runAiExpand() {
     let text = '';
     stream.on('text', (delta) => {
       text += delta;
-      state.overview = text;
+      state.overview = replaceIntro(original, text);
       const el = ta();
-      if (el) { el.value = text; el.scrollTop = el.scrollHeight; }
+      if (el) el.value = state.overview;
     });
     const final = await stream.finalMessage();
-    if (final.stop_reason === 'refusal') text += '\n\n【AI 拒絕產生此內容，請修改大致內容後再試】';
-    else if (final.stop_reason === 'max_tokens') text += '\n\n【內容過長被截斷】';
-    state.overview = composeOverview(text);
+    if (final.stop_reason === 'refusal') { state.overview = original; throw new Error('AI 拒絕產生此內容，請修改第一段後再試'); }
+    if (final.stop_reason === 'max_tokens') text += '【內容過長被截斷】';
+    state.overview = replaceIntro(original, text);
     toast('AI 已完成作業概述，可直接修改', 'ok');
   } catch (err) {
     let msg = err.message;
@@ -1407,6 +1424,7 @@ async function runAiExpand() {
     else if (err instanceof Anthropic.RateLimitError) msg = '請求太頻繁或額度不足，請稍後再試';
     else if (err instanceof Anthropic.APIConnectionError) msg = '無法連線 Claude API，請檢查網路';
     else if (err instanceof Anthropic.APIError) msg = `Claude API 錯誤（${err.status ?? ''}）：${err.message}`;
+    state.overview = original;
     toast(`AI 生成失敗：${msg}`, 'error');
   } finally {
     ui.aiBusy = false;
@@ -1434,7 +1452,7 @@ function kmlColor(hex, alpha) { // #rrggbb → aabbggrr
   const h = hex.replace('#', '');
   return `${alpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`;
 }
-function buildKml(airspaces, includeLaunch, docName) {
+function buildKml(airspaces, docName) {
   const styles = airspaces.map((as, i) => `
     <Style id="as${i}"><LineStyle><color>${kmlColor(as.color, 'ff')}</color><width>2.5</width></LineStyle><PolyStyle><color>${kmlColor(as.color, '55')}</color></PolyStyle></Style>`).join('');
   const placemarks = airspaces.map((as, i) => {
@@ -1460,19 +1478,12 @@ function buildKml(airspaces, includeLaunch, docName) {
       <Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>${coords}</coordinates></LinearRing></outerBoundaryIs></Polygon>
     </Placemark>`;
   }).join('');
-  const lps = state.launchPoints.filter((lp) => airspaces.some((a) => a.id === lp.airspaceId));
-  const launch = includeLaunch && lps.length ? `
-    <Folder><name>預計起飛地點</name>${lps.map((lp) => `
-      <Placemark><name>起飛點 ${launchLabel(lp)} ${xmlEsc(lp.name)}</name>
-        <description>${xmlEsc(`${getAs(lp.airspaceId)?.name || ''}｜${fmtCoord([lp.lat, lp.lng])}`)}</description>
-        <Point><coordinates>${lp.lng.toFixed(7)},${lp.lat.toFixed(7)},0</coordinates></Point></Placemark>`).join('')}
-    </Folder>` : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
   <Document>
     <name>${xmlEsc(docName)}</name>${styles}
     <Folder><name>作業空域</name>${placemarks}
-    </Folder>${launch}
+    </Folder>
   </Document>
 </kml>
 `;
@@ -1481,11 +1492,10 @@ function buildKml(airspaces, includeLaunch, docName) {
 const kmlFileBase = (as) => safeName(`${as.area.trim() || '未填地點'}_${as.name.trim() || '空域'}`);
 async function exportKml() {
   if (!state.airspaces.length) { toast('尚未繪製任何空域', 'error'); return; }
-  const includeLaunch = state.step >= 3 && state.includeLaunchInKml;
   for (const [i, as] of state.airspaces.entries()) {
     if (i) await new Promise((r) => setTimeout(r, 400)); // 連續下載間隔，避免瀏覽器略過
     const base = kmlFileBase(as);
-    download(new Blob([buildKml([as], includeLaunch, base)], { type: 'application/vnd.google-earth.kml+xml' }), `${base}.kml`);
+    download(new Blob([buildKml([as], base)], { type: 'application/vnd.google-earth.kml+xml' }), `${base}.kml`);
   }
   if (state.airspaces.length > 1) toast(`已輸出 ${state.airspaces.length} 個 KML 檔（瀏覽器若詢問「允許下載多個檔案」請按允許）`, 'ok');
 }
@@ -1500,15 +1510,10 @@ function exportPdf() {
   const html = `<!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><title>${esc(fileTitle)}</title><style>
     @page { size: A4; margin: 25mm; }
     body { font-family: "BiauKai", "DFKai-SB", "標楷體", "Kaiti TC", "STKaiti", serif; font-size: 12pt; line-height: 1.5; color: #000; margin: 0; }
-    h1 { text-align: center; font-size: 18pt; margin: 0 0 18pt; }
-    .label { font-size: 14pt; font-weight: bold; margin: 0; }
-    .label span { font-weight: normal; }
     p { margin: 0; white-space: pre-wrap; }
     .sec { font-weight: bold; }
   </style></head><body>
-    <h1>${esc(caseName)}</h1>
-    <p class="label">案名：<span>${esc(caseName)}</span></p>
-    <p class="label" style="margin-top:12pt">作業概述：</p>
+    <p class="sec">作業概述</p>
     ${body}
   </body></html>`;
   const iframe = document.createElement('iframe');
@@ -1540,9 +1545,7 @@ async function exportWord() {
       sections: [{
         properties: { page: { margin: { top: margin, bottom: margin, left: margin, right: margin } } },
         children: [
-          new d.Paragraph({ alignment: d.AlignmentType.CENTER, spacing: { after: 360 }, children: [run(caseName, 18, true)] }),
-          new d.Paragraph({ children: [run('案名：', 14, true), run(caseName, 14)] }),
-          new d.Paragraph({ spacing: { before: 240 }, children: [run('作業概述：', 14, true)] }),
+          new d.Paragraph({ spacing: { line: 360, after: 0 }, children: [run('作業概述', 12, true)] }),
           ...body,
         ],
       }],
@@ -1603,6 +1606,11 @@ function goStep(n, force = false) {
   renderCandidates();
   renderPanel();
   $('#panel').scrollTop = 0;
+  if (n === 4 && state.launchPoints.length) {
+    state.overview = mergeLaunchText(state.overview);
+    save();
+    renderPanel();
+  }
   if (n === 3) {
     state.airspaces.forEach((as) => {
       if (!lpsOf(as.id).length) autoGenerate(as);
@@ -1735,20 +1743,18 @@ function renderStep2() {
   return `<div class="panel-body">
     <div>
       <h2>步驟 2　案名與作業概述</h2>
-      <p class="lead">先輸入大致內容（片名、委託單位、拍攝內容），按 AI 擴充後會依格式寫成：「本案係辦理「片名」紀錄片，受○○委託，…」＋【預計起飛地點】＋「將遵循所有規定並加強安全控管」。缺少的資訊會以【待確認】標示。</p>
+      <p class="lead">在作業概述第一段填入片名（XX）、委託單位（XX）與拍攝規劃與內容，可按 AI 潤飾第一段；未填的部分會以【待確認】標示。【預計起飛地點】會在下一步貼入。</p>
     </div>
     <label class="field">案名<input type="text" data-field="caseName" value="${esc(state.caseName)}"></label>
     ${caseNameOptionsHtml()}
-    <label class="field">作業大致內容
-      <textarea data-field="draft" rows="6" placeholder="例：片名「山海之間」，受宜蘭縣政府委託，拍攝頭城海岸、龜山島與五結鄉的自然景觀和在地生活…">${esc(state.draft)}</textarea>
+    <label class="field">作業概述
+      <textarea class="overview" data-field="overview" ${ui.aiBusy ? 'readonly' : ''}>${esc(state.overview)}</textarea>
     </label>
-    ${aiNote}
     <div class="btn-row">
-      <button class="btn" data-action="ai-expand" ${ui.aiBusy ? 'disabled' : ''}>${ui.aiBusy ? '<span class="spinner"></span> AI 撰寫中…' : '✨ AI 擴充生成作業概述'}</button>
+      <button class="btn" data-action="ai-expand" ${ui.aiBusy ? 'disabled' : ''}>${ui.aiBusy ? '<span class="spinner"></span> AI 撰寫中…' : '✨ AI 潤飾第一段'}</button>
+      <button class="btn ghost small" data-action="overview-reset">↺ 還原預設範本</button>
     </div>
-    <label class="field">作業概述 <small>可直接編輯；下一步的起飛點可一鍵貼到這裡</small>
-      <textarea class="overview" data-field="overview" ${ui.aiBusy ? 'readonly' : ''} placeholder="按「AI 擴充生成」或自行輸入">${esc(state.overview)}</textarea>
-    </label>
+    ${aiNote}
   </div>
   ${footer(
     '<button class="btn ghost" data-action="prev">← 上一步</button>',
@@ -1861,13 +1867,12 @@ function renderStep4() {
     ${coordFormatSelect()}
     <h3>空域與起飛點</h3>
     ${asCards}
-    <label class="inline"><input type="checkbox" data-field="includeLaunchInKml" ${state.includeLaunchInKml ? 'checked' : ''}> KML 同時包含起飛點</label>
   </div>
   ${footer(
     '<button class="btn ghost" data-action="prev">← 上一步</button>',
-    `<button class="btn ghost" data-action="export-kml" ${overLimit() ? 'disabled' : ''}>🗺 輸出 KML</button>
-     <button class="btn ghost" data-action="export-pdf" ${overLimit() ? 'disabled' : ''}>📑 輸出 PDF</button>
-     <button class="btn" data-action="export-word" ${overLimit() ? 'disabled' : ''}>📄 輸出 Word</button>`,
+    `<button class="btn ghost small" data-action="export-kml" ${overLimit() ? 'disabled' : ''}>🗺 KML</button>
+     <button class="btn ghost small" data-action="export-pdf" ${overLimit() ? 'disabled' : ''}>📑 PDF</button>
+     <button class="btn small" data-action="export-word" ${overLimit() ? 'disabled' : ''}>📄 Word</button>`,
   )}`;
 }
 
@@ -1898,6 +1903,15 @@ panelEl.addEventListener('input', (e) => {
     } else {
       as[f] = t.value;
       if (f === 'area') as.areaAuto = false;
+      if (f === 'name' && asNumber(as.name) != null && state.airspaces.indexOf(as) !== Math.min(asNumber(as.name), state.airspaces.length) - 1) {
+        moveByName(as);
+        save();
+        renderAirspaces();
+        renderLaunch();
+        renderPanel();
+        requestAnimationFrame(() => document.querySelector(`[data-card="${as.id}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+        return;
+      }
     }
     save();
     return;
@@ -2027,6 +2041,12 @@ function handleAction(action, data, btn) {
     case 'export-kml': exportKml(); break;
     case 'export-word': exportWord(); break;
     case 'export-pdf': exportPdf(); break;
+    case 'overview-reset':
+      if (!confirm('作業概述會還原成預設範本（起飛點段落會保留），確定？')) return;
+      state.overview = replaceIntro(state.overview, DEFAULT_INTRO);
+      save();
+      renderPanel();
+      break;
     case 'case-name-default':
       state.caseNameAuto = true;
       save();
