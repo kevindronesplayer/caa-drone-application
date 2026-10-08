@@ -58,6 +58,24 @@ const ui = {
   aiBusy: false,
 };
 
+// 「空域N」的 N 就是排列順序：改名成空域1 會移到最前面，其他「空域N」依位置重新編號
+const AS_NAME_RE = /^空域\s*([0-9０-９]+)$/;
+function asNumber(name) {
+  const m = String(name).trim().match(AS_NAME_RE);
+  return m ? Number(m[1].replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))) : null;
+}
+function renumberAirspaces() {
+  state.airspaces.forEach((a, i) => { if (asNumber(a.name) != null) a.name = `空域${i + 1}`; });
+}
+function moveByName(as) {
+  const k = asNumber(as.name);
+  if (k == null) return false;
+  const others = state.airspaces.filter((a) => a !== as);
+  others.splice(Math.min(Math.max(k - 1, 0), others.length), 0, as);
+  state.airspaces = others;
+  renumberAirspaces();
+  return true;
+}
 const getAs = (id) => state.airspaces.find((a) => a.id === id);
 const getLp = (id) => state.launchPoints.find((p) => p.id === id);
 const lpsOf = (asId) => state.launchPoints.filter((p) => p.airspaceId === asId);
@@ -134,6 +152,8 @@ const OVERPASS_URLS = [
 ];
 // 有些地下／立體停車場沒標 parking 類型，只寫在名稱裡
 const INDOOR_PARKING_WORDS = ['地下', '立體', '室內', '大樓', 'B1', 'B2'];
+// 宗教場所只要廟宇；沒標宗教別的教堂靠名稱排除
+const NON_TEMPLE_WORDS = ['教會', '教堂', '天主堂', '禮拜堂', '清真寺', '聚會所'];
 const overpassCache = new Map();
 
 // 範圍內的公園與戶外停車場；各鏡像站速度時好時壞，同時查詢取最先成功的
@@ -141,14 +161,15 @@ async function queryLaunchCandidates(south, west, north, east) {
   const key = [south, west, north, east].map((v) => v.toFixed(4)).join(',');
   if (overpassCache.has(key)) return overpassCache.get(key);
   const bbox = `${south},${west},${north},${east}`;
-  const query = `[out:json][timeout:25];
+  const query = `[out:json][timeout:50];
 (
   nwr["leisure"~"^(park|recreation_ground|garden)$"]["access"!~"^(private|no)$"](${bbox});
   nwr["amenity"="parking"]["parking"!~"^(underground|multi-storey|rooftop)$"]["location"!~"underground"]["access"!~"^(private|no)$"](${bbox});
+  nwr["amenity"="place_of_worship"]["religion"!~"^(christian|muslim|jewish|bahai)$"](${bbox});
 );
-out center tags 500;`;
+out center tags 800;`;
   const ctrls = OVERPASS_URLS.map(() => new AbortController());
-  const timer = setTimeout(() => ctrls.forEach((c) => c.abort()), 40000);
+  const timer = setTimeout(() => ctrls.forEach((c) => c.abort()), 60000);
   let elements;
   try {
     elements = await Promise.any(OVERPASS_URLS.map(async (url, i) => {
@@ -168,11 +189,12 @@ out center tags 500;`;
     const lng = el.lon ?? el.center?.lon;
     if (lat == null || lng == null) continue;
     const tags = el.tags || {};
-    const kind = tags.amenity === 'parking' ? 'parking' : 'park';
+    const kind = tags.amenity === 'parking' ? 'parking' : tags.amenity === 'place_of_worship' ? 'temple' : 'park';
     let name = tags['name:zh'] || tags.name || '';
     if (kind === 'parking' && INDOOR_PARKING_WORDS.some((w) => name.includes(w))) continue;
+    if (kind === 'temple' && NON_TEMPLE_WORDS.some((w) => name.includes(w))) continue;
     const named = Boolean(name);
-    if (!name) name = kind === 'parking' ? '戶外停車場' : '公園綠地';
+    if (!name) name = { parking: '戶外停車場', temple: '廟宇', park: '公園綠地' }[kind];
     list.push({ id: `${el.type}/${el.id}`, lat, lng, kind, name, named });
   }
   overpassCache.set(key, list);
@@ -292,12 +314,16 @@ async function computeMaxElevation(as) {
     best = { m: data[i] * 256 + data[i + 1] + data[i + 2] / 256 - 32768, lat, lng };
   }
   const m = Math.max(0, best.m); // 海面為負值
-  return { key: geomKey(as), m: Math.round(m), ft: Math.round(m * 3.28084), lat: best.lat, lng: best.lng };
+  return { v: ELEV_VERSION, key: geomKey(as), m: Math.round(m), ft: Math.ceil(m * 3.28084), lat: best.lat, lng: best.lng };
 }
+const ELEV_VERSION = 2; // v2：英尺改為無條件進位
+const MIN_HEIGHT_MARGIN_FT = 400;
+const elevReady = (as) => as.elev && !as.elev.error && as.elev.v === ELEV_VERSION && as.elev.key === geomKey(as);
+const minApplyFt = (as) => as.elev.ft + MIN_HEIGHT_MARGIN_FT;
 const elevPending = new Map();
 function refreshElevation(as) {
   const key = geomKey(as);
-  if (as.elev?.key === key || elevPending.get(as.id) === key) return;
+  if (elevReady(as) || elevPending.get(as.id) === key) return;
   elevPending.set(as.id, key);
   computeMaxElevation(as).then((elev) => {
     if (geomKey(as) !== elev.key) return; // 計算期間空域又被改過
@@ -312,9 +338,10 @@ function refreshElevation(as) {
 }
 function elevationHtml(as) {
   const ev = as.elev;
-  if (!ev || ev.key !== geomKey(as)) return '<div class="meta"><span class="spinner"></span> 計算空域內最大地表高度…</div>';
-  if (ev.error) return `<div class="meta">⚠️ 最大地表高度計算失敗（${esc(ev.error)}）</div>`;
-  return `<div class="stat">⛰ 空域內最大地表高度：<b>約 ${ev.ft.toLocaleString()} ft</b> <span class="meta">（${ev.m} m，位置 ${esc(fmtCoord([ev.lat, ev.lng]))}）</span></div>`;
+  if (ev?.error && ev.key === geomKey(as)) return `<div class="meta">⚠️ 最大地表高度計算失敗（${esc(ev.error)}）</div>`;
+  if (!elevReady(as)) return '<div class="meta"><span class="spinner"></span> 計算空域內最大地表高度…</div>';
+  return `<div class="stat">⛰ 空域內最大地表高度：<b>${ev.ft.toLocaleString()} ft</b> <span class="meta">（${ev.m} m，位置 ${esc(fmtCoord([ev.lat, ev.lng]))}）</span></div>
+    <div class="stat">🛫 最低可申請高度：<b>${minApplyFt(as).toLocaleString()} ft</b> <span class="meta">（最大地表高度無條件進位 + ${MIN_HEIGHT_MARGIN_FT} ft）</span></div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -359,13 +386,18 @@ function updateAirports(as) {
   near.sort((a, b) => a.nm - b.nm);
   ui.airports[as.id] = near;
 }
+const APPROACH_NM = 3;
+const fmtNm = (a) => `${a.nm.toFixed(2)} 海里（${(a.nm * NM / 1000).toFixed(2)} 公里）`;
+// 以顯示到小數第 2 位的值判斷，避免畫面顯示 3.00 卻沒有提示
+const inApproach = (a) => Number(a.nm.toFixed(2)) <= APPROACH_NM;
 function airportHtml(as) {
   const near = ui.airports[as.id];
   if (!near?.length) return '';
-  return near.map((a) => `<div class="notice danger">✈️ 位於 <b>${esc(a.name)}</b>（${a.icao}）10 公里內：空域最近點距 <b>RWY ${esc(a.rwy)} 跑道頭 ${a.nm.toFixed(2)} 海里</b>
+  return near.map((a) => `<div class="notice danger">✈️ 位於 <b>${esc(a.name)}</b>（${a.icao}）10 公里內：空域最近點距 <b>RWY ${esc(a.rwy)} 跑道頭 ${fmtNm(a)}</b>
+    ${inApproach(a) ? `<div class="approach">⚠️ 受${esc(a.name)}近離場影響</div>` : ''}
     <div class="meta">空域最近點 ${esc(fmtCoord(a.p))}</div></div>`).join('');
 }
-const airportText = (a) => `距${a.name}（${a.icao}）RWY ${a.rwy} 跑道頭 ${a.nm.toFixed(2)} 海里`;
+const airportText = (a) => `距${a.name}（${a.icao}）RWY ${a.rwy} 跑道頭 ${fmtNm(a)}${inApproach(a) ? `，受${a.name}近離場影響` : ''}`;
 
 // ═══════════════════════════════════════════════════════════════
 // 地圖
@@ -525,7 +557,7 @@ function renderElevation() {
   elevGroup.clearLayers();
   state.airspaces.forEach((as) => {
     const ev = as.elev;
-    if (!ev || ev.error || ev.key !== geomKey(as)) return;
+    if (!elevReady(as)) return;
     L.marker([ev.lat, ev.lng], {
       icon: L.divIcon({ className: '', html: '<div class="peak-icon">▲</div>', iconSize: [0, 0] }),
       interactive: true, keyboard: false,
@@ -538,7 +570,7 @@ function renderAirportLines() {
   state.airspaces.forEach((as) => {
     (ui.airports[as.id] || []).forEach((a) => {
       L.polyline([a.p, a.th], { color: '#c62828', weight: 2, dashArray: '6,5', interactive: false })
-        .bindTooltip(`${a.nm.toFixed(2)} NM`, { permanent: true, direction: 'center', className: 'dist-label' })
+        .bindTooltip(`${a.nm.toFixed(2)} NM（${(a.nm * NM / 1000).toFixed(2)} km）`, { permanent: true, direction: 'center', className: 'dist-label' })
         .addTo(airportGroup);
       L.circleMarker(a.th, { radius: 5, color: '#c62828', fillColor: '#fff', fillOpacity: 1, weight: 2 })
         .bindTooltip(`${a.name} RWY ${a.rwy} 跑道頭`, { direction: 'top' })
@@ -737,7 +769,7 @@ function renderDraw() {
 function newAirspace(fields) {
   const n = state.asSeq++;
   const as = {
-    id: uid('as'), name: `空域${n}`, area: '',
+    id: uid('as'), name: `空域${state.airspaces.length + 1}`, area: '',
     color: AS_COLORS[(n - 1) % AS_COLORS.length], ...fields,
   };
   state.airspaces.push(as);
@@ -839,7 +871,7 @@ async function importKmlFile(file) {
       const res = coords && ringToAirspace(parseKmlCoords(coords.textContent), meta);
       if (!res) return;
       const n = state.asSeq++;
-      const label = name ? (polys.length > 1 ? `${name}-${k + 1}` : name) : `空域${n}`;
+      const label = name ? (polys.length > 1 ? `${name}-${k + 1}` : name) : `空域${state.airspaces.length + 1}`;
       const as = {
         id: uid('as'), name: label, area: meta['地點'] || '',
         color: AS_COLORS[(n - 1) % AS_COLORS.length], ...res.airspace,
@@ -865,6 +897,7 @@ async function importKmlFile(file) {
     state.launchPoints.push({ id: uid('lp'), airspaceId: as.id, lat: p.lat, lng: p.lng, name: p.name || '空域內地點', kind: 'manual' });
     lpCount += 1;
   }
+  renumberAirspaces();
   added.forEach((as) => { refreshDerived(as); if (!as.area) fillAreaName(as); });
   ui.selectedAirspaceId = added[0].id;
   save();
@@ -948,7 +981,7 @@ function launchLabel(lp) {
   const k = lpsOf(lp.airspaceId).findIndex((p) => p.id === lp.id);
   return `${asIdx + 1}-${k + 1}`;
 }
-const kindLabel = { park: '公園', parking: '停車場', manual: '自訂' };
+const kindLabel = { park: '公園', parking: '停車場', temple: '廟宇', manual: '自訂' };
 
 async function ensureCandidates(as, force = false) {
   const key = geomKey(as);
@@ -1010,15 +1043,20 @@ function farthestPair(items, pos, weight = () => 1) {
 function pickLaunchSites(as, candidates) {
   const geo = geometricPoints(as).map((p) => ({ lat: p[0], lng: p[1], name: '', kind: 'manual' }));
   const pos = (c) => [c.lat, c.lng];
-  if (candidates.length >= 2) {
-    return farthestPair(candidates, pos, (c) => (c.named ? 1 : 0.85)).map((c) => ({ lat: c.lat, lng: c.lng, name: c.name, kind: c.kind }));
+  const toLp = (c) => ({ lat: c.lat, lng: c.lng, name: c.name, kind: c.kind });
+  const farthestFrom = (c, list) => list.reduce((a, b) => (distM(pos(b), pos(c)) > distM(pos(a), pos(c)) ? b : a));
+  const weight = (c) => (c.named ? 1 : 0.85);
+  // 依優先順序：公園／戶外停車場 → 廟宇 → 空域對角線幾何點
+  const tiers = [candidates.filter((c) => c.kind !== 'temple'), candidates.filter((c) => c.kind === 'temple'), geo];
+  for (let t = 0; t < tiers.length; t++) {
+    const list = tiers[t];
+    if (list.length >= 2) return farthestPair(list, pos, weight).map(toLp);
+    if (list.length === 1) {
+      const next = tiers.slice(t + 1).find((l) => l.length);
+      return [toLp(list[0]), toLp(farthestFrom(list[0], next))];
+    }
   }
-  if (candidates.length === 1) {
-    const c = candidates[0];
-    const far = geo.reduce((a, b) => (distM(pos(b), pos(c)) > distM(pos(a), pos(c)) ? b : a));
-    return [{ lat: c.lat, lng: c.lng, name: c.name, kind: c.kind }, far];
-  }
-  return farthestPair(geo, pos) || geo.slice(0, 2);
+  return geo.slice(0, 2).map(toLp);
 }
 async function autoGenerate(as) {
   const list = await ensureCandidates(as);
@@ -1124,7 +1162,7 @@ function renderLaunch() {
 }
 
 function candIcon(kind) {
-  return L.divIcon({ className: '', html: `<div class="cand-icon ${kind}">${kind === 'parking' ? 'P' : '🌳'}</div>`, iconSize: [0, 0] });
+  return L.divIcon({ className: '', html: `<div class="cand-icon ${kind}">${{ parking: 'P', temple: '廟', park: '🌳' }[kind]}</div>`, iconSize: [0, 0] });
 }
 function renderCandidates() {
   candGroup.clearLayers();
@@ -1220,7 +1258,10 @@ function airspaceSummary() {
     if (as.type === 'circle') lines.push(`  範圍：圓形，圓心 ${fmtCoord(as.center)}，半徑 ${Math.round(as.radius)} 公尺`);
     else lines.push(`  範圍：多邊形 ${as.points.length} 點，頂點 ${as.points.map(fmtCoord).join('；')}`);
     lines.push(`  面積：約 ${(asArea(as) / 1e4).toFixed(2)} 公頃`);
-    if (as.elev?.ft != null && as.elev.key === geomKey(as)) lines.push(`  空域內最大地表高度：約 ${as.elev.ft} 英尺（${as.elev.m} 公尺）`);
+    if (elevReady(as)) {
+      lines.push(`  空域內最大地表高度：${as.elev.ft} 英尺（${as.elev.m} 公尺）`);
+      lines.push(`  最低可申請高度：${minApplyFt(as)} 英尺`);
+    }
     (ui.airports[as.id] || []).forEach((a) => lines.push(`  鄰近機場：空域最近點${airportText(a)}`));
     const w = ui.warnings[as.id];
     if (w?.zones.length) lines.push(`  與民航局公告限制區重疊：${w.zones.join('、')}`);
@@ -1298,17 +1339,17 @@ function kmlColor(hex, alpha) { // #rrggbb → aabbggrr
   const h = hex.replace('#', '');
   return `${alpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`;
 }
-function buildKml(includeLaunch) {
-  const styles = state.airspaces.map((as, i) => `
+function buildKml(airspaces, includeLaunch, docName) {
+  const styles = airspaces.map((as, i) => `
     <Style id="as${i}"><LineStyle><color>${kmlColor(as.color, 'ff')}</color><width>2.5</width></LineStyle><PolyStyle><color>${kmlColor(as.color, '55')}</color></PolyStyle></Style>`).join('');
-  const placemarks = state.airspaces.map((as, i) => {
+  const placemarks = airspaces.map((as, i) => {
     const ring = asFeature(as).geometry.coordinates[0];
     // KML 外環建議逆時針
     const ccw = turf.booleanClockwise(ring) ? ring.slice().reverse() : ring;
     const coords = ccw.map(([lng, lat]) => `${lng.toFixed(7)},${lat.toFixed(7)},0`).join(' ');
     const desc = [
       `地點：${as.area || ''}`,
-      as.elev?.ft != null ? `最大地表高度：約 ${as.elev.ft} ft（${as.elev.m} m）` : '',
+      elevReady(as) ? `最大地表高度：${as.elev.ft} ft（${as.elev.m} m）<br>最低可申請高度：${minApplyFt(as)} ft` : '',
       ...(ui.airports[as.id] || []).map((a) => `空域最近點${airportText(a)}`),
       as.type === 'circle' ? `圓形：圓心 ${fmtCoord(as.center)}，半徑 ${Math.round(as.radius)} 公尺` : `多邊形頂點：${as.points.map(fmtCoord).join('；')}`,
     ].filter(Boolean).join('<br>');
@@ -1319,7 +1360,7 @@ function buildKml(includeLaunch) {
       <styleUrl>#as${i}</styleUrl>
       <ExtendedData>
         <Data name="地點"><value>${xmlEsc(as.area)}</value></Data>
-        ${as.elev?.ft != null ? `<Data name="最大地表高度_ft"><value>${as.elev.ft}</value></Data>` : ''}
+        ${elevReady(as) ? `<Data name="最大地表高度_ft"><value>${as.elev.ft}</value></Data><Data name="最低可申請高度_ft"><value>${minApplyFt(as)}</value></Data>` : ''}
         <Data name="形狀"><value>${as.type === 'circle' ? '圓形' : '多邊形'}</value></Data>
         ${as.type === 'circle' ? `<Data name="半徑_公尺"><value>${Math.round(as.radius)}</value></Data>` : ''}
         <Data name="CKWT座標"><value>${xmlEsc(ckwtList(as))}</value></Data>
@@ -1327,8 +1368,9 @@ function buildKml(includeLaunch) {
       <Polygon><tessellate>1</tessellate><outerBoundaryIs><LinearRing><coordinates>${coords}</coordinates></LinearRing></outerBoundaryIs></Polygon>
     </Placemark>`;
   }).join('');
-  const launch = includeLaunch && state.launchPoints.length ? `
-    <Folder><name>預計起飛地點</name>${state.launchPoints.map((lp) => `
+  const lps = state.launchPoints.filter((lp) => airspaces.some((a) => a.id === lp.airspaceId));
+  const launch = includeLaunch && lps.length ? `
+    <Folder><name>預計起飛地點</name>${lps.map((lp) => `
       <Placemark><name>起飛點 ${launchLabel(lp)} ${xmlEsc(lp.name)}</name>
         <description>${xmlEsc(`${getAs(lp.airspaceId)?.name || ''}｜${fmtCoord([lp.lat, lp.lng])}`)}</description>
         <Point><coordinates>${lp.lng.toFixed(7)},${lp.lat.toFixed(7)},0</coordinates></Point></Placemark>`).join('')}
@@ -1336,17 +1378,24 @@ function buildKml(includeLaunch) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
   <Document>
-    <name>${xmlEsc(state.caseName || '無人機作業空域')}</name>${styles}
+    <name>${xmlEsc(docName)}</name>${styles}
     <Folder><name>作業空域</name>${placemarks}
     </Folder>${launch}
   </Document>
 </kml>
 `;
 }
-function exportKml() {
+// 每個空域一個檔案，檔名：地點_空域N（例：宜蘭縣宜蘭市_空域1.kml）
+const kmlFileBase = (as) => safeName(`${as.area.trim() || '未填地點'}_${as.name.trim() || '空域'}`);
+async function exportKml() {
   if (!state.airspaces.length) { toast('尚未繪製任何空域', 'error'); return; }
   const includeLaunch = state.step >= 3 && state.includeLaunchInKml;
-  download(new Blob([buildKml(includeLaunch)], { type: 'application/vnd.google-earth.kml+xml' }), `${safeName(state.caseName)}_空域.kml`);
+  for (const [i, as] of state.airspaces.entries()) {
+    if (i) await new Promise((r) => setTimeout(r, 400)); // 連續下載間隔，避免瀏覽器略過
+    const base = kmlFileBase(as);
+    download(new Blob([buildKml([as], includeLaunch, base)], { type: 'application/vnd.google-earth.kml+xml' }), `${base}.kml`);
+  }
+  if (state.airspaces.length > 1) toast(`已輸出 ${state.airspaces.length} 個 KML 檔（瀏覽器若詢問「允許下載多個檔案」請按允許）`, 'ok');
 }
 async function exportWord() {
   if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
@@ -1603,7 +1652,7 @@ function renderStep3() {
     const c = ui.candidates[as.id];
     const status = !c ? '' : c.loading ? '<span class="spinner"></span> 搜尋公園／停車場中…'
       : c.error ? `⚠️ 查詢失敗（${esc(c.error)}）`
-      : `空域內找到 ${c.list.filter((x) => x.kind === 'park').length} 處公園、${c.list.filter((x) => x.kind === 'parking').length} 處戶外停車場`;
+      : `空域內找到 ${c.list.filter((x) => x.kind === 'park').length} 處公園、${c.list.filter((x) => x.kind === 'parking').length} 處戶外停車場、${c.list.filter((x) => x.kind === 'temple').length} 處廟宇`;
     const adding = ui.mode === 'addLaunch' && ui.addFor === as.id;
     return `<div class="card" data-card="${as.id}">
       <div class="card-head"><span class="swatch" style="background:${as.color}"></span><b>${esc(as.name)}</b><span class="meta">${esc(as.area)}</span></div>
@@ -1620,8 +1669,8 @@ function renderStep3() {
   return `<div class="panel-body">
     <div>
       <h2>步驟 3　預計起飛地點</h2>
-      <p class="lead">每個空域自動產生 2 個起飛點：優先挑空域內<b>相距最遠</b>的公園或戶外停車場，找不到時改用空域對角線位置。
-      點選地圖上的起飛點後，再點新位置或綠色🌳／藍色P候選點即可修改，也可直接拖曳（拖到候選點旁會自動吸附）。</p>
+      <p class="lead">每個空域自動產生 2 個起飛點：優先挑空域內<b>相距最遠</b>的公園或戶外停車場，不足時用廟宇，再不足才用空域對角線位置。
+      點選地圖上的起飛點後，再點新位置或候選點（🌳公園／P停車場／廟）即可修改，也可直接拖曳（拖到候選點旁會自動吸附）。</p>
     </div>
     ${ui.mode === 'moveLaunch' ? `<div class="notice info">正在移動起飛點 <b>${launchLabel(getLp(ui.selectedLaunchId) || {})}</b>：點選空域內新位置或候選點。<button class="btn ghost tiny" data-action="mode-cancel">取消</button></div>` : ''}
     ${ui.mode === 'addLaunch' ? '<div class="notice info">點選空域內的位置或候選點以新增。<button class="btn ghost tiny" data-action="mode-cancel">取消</button></div>' : ''}
@@ -1651,6 +1700,7 @@ function renderStep4() {
       </div>
       <label class="field">地點<input type="text" data-as-field="area" data-id="${as.id}" value="${esc(as.area)}"></label>
       ${airspaceInfoHtml(as)}
+      <div class="meta">KML 檔名：<b>${esc(kmlFileBase(as))}.kml</b></div>
       <div class="meta">CKWT 座標${as.type === 'circle' ? '（圓心）' : ''}：</div>
       <div class="inline"><input type="text" class="coord" readonly value="${esc(ckwtList(as))}"><button class="btn ghost tiny" data-action="copy" data-text="${esc(ckwtList(as))}">複製</button></div>
       <div class="meta"><b>起飛點</b></div>
@@ -1717,6 +1767,14 @@ panelEl.addEventListener('change', (e) => {
     const as = getAs(t.dataset.id);
     if (!as) return;
     if (t.dataset.asField === 'radius') { commitAirspaceEdit(as); return; }
+    if (t.dataset.asField === 'name' && moveByName(as)) {
+      save();
+      renderAirspaces();
+      renderLaunch();
+      renderPanel();
+      requestAnimationFrame(() => document.querySelector(`[data-card="${as.id}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+      return;
+    }
     renderAirspaces();
     renderLaunch();
   }
@@ -1778,6 +1836,7 @@ function handleAction(action, data, btn) {
       state.airspaces = state.airspaces.filter((a) => a.id !== data.id);
       state.launchPoints = state.launchPoints.filter((p) => p.airspaceId !== data.id);
       if (ui.selectedAirspaceId === data.id) ui.selectedAirspaceId = null;
+      renumberAirspaces();
       save(); renderAirspaces(); renderLaunch(); renderCandidates(); renderPanel();
       break;
     }
