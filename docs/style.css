@@ -238,3 +238,5 @@ details.notice[open] summary { margin-bottom: 4px; }
 .approach { font-weight: 700; margin-top: 4px; }
 .cand-icon.temple { background: #bf360c; color: #fff; font-size: 11px; }
 .tag.temple { background: #fbe9e7; color: #bf360c; }
+.case-options { flex-wrap: wrap; gap: 10px; margin-top: -6px; font-size: 13px; }
+.case-options input[type=checkbox] { width: auto; }

@@ -17,7 +17,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 // ── 狀態 ──────────────────────────────────────────────────────
 function newState() {
   return {
-    version: 2, step: 1, caseName: '', draft: '', overview: '',
+    version: 3, step: 1, caseName: '', caseNameAuto: true, highAltitude: false, draft: '', overview: '',
     coordFormat: 'decimal', includeLaunchInKml: false,
     airspaces: [], launchPoints: [], seq: 1, asSeq: 1,
   };
@@ -35,12 +35,42 @@ function migrate(s) {
     s.airspaces.forEach((as) => delete as.height);
     s.version = 2;
   }
+  if (s.version < 3) { // v3：案名預設格式、400 呎以上選項
+    s.caseNameAuto = !s.caseName;
+    s.highAltitude = false;
+    s.version = 3;
+  }
   return s;
 }
 let state = loadState() || newState();
 function save() {
+  if (state.caseNameAuto) state.caseName = defaultCaseName();
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* 無痕模式等 */ }
   $('#caseLabel').textContent = state.caseName || '未命名案件';
+}
+// 案名預設：年份＋季節＋各空域縣市＋紀錄片拍攝 空拍攝影，400 呎以上加 (高空)
+const CASE_NAME_SUFFIX = '紀錄片拍攝 空拍攝影';
+const HIGH_ALT_SUFFIX = '(高空)';
+function seasonOf(d) {
+  const m = d.getMonth() + 1;
+  if (m >= 3 && m <= 5) return '春季';
+  if (m >= 6 && m <= 8) return '夏季';
+  if (m >= 9 && m <= 11) return '秋季';
+  return '冬季';
+}
+const shortCounty = (c) => c.replace(/^臺/, '台').replace(/[縣市]$/, '');
+function caseCounties() {
+  const list = [];
+  for (const as of state.airspaces) {
+    const fromArea = (as.area || '').match(/^(.{2}[縣市])/)?.[1];
+    const counties = ui.regions[as.id]?.counties?.length ? ui.regions[as.id].counties : (fromArea ? [fromArea] : []);
+    counties.forEach((c) => { const sc = shortCounty(c); if (!list.includes(sc)) list.push(sc); });
+  }
+  return list;
+}
+function defaultCaseName() {
+  const now = new Date();
+  return `${now.getFullYear()}${seasonOf(now)}${caseCounties().join('')}${CASE_NAME_SUFFIX}${state.highAltitude ? HIGH_ALT_SUFFIX : ''}`;
 }
 const uid = (prefix) => `${prefix}${state.seq++}`;
 
@@ -55,6 +85,7 @@ const ui = {
   caa: { items: [], source: null },
   warnings: {},            // asId → { zones: [], kinks: bool }
   airports: {},            // asId → 10 公里內的機場與最近跑道頭距離
+  regions: {},             // asId → 涵蓋的縣市、是否跨海岸線、計為幾個空域
   aiBusy: false,
 };
 
@@ -397,7 +428,72 @@ function airportHtml(as) {
     ${inApproach(a) ? `<div class="approach">⚠️ 受${esc(a.name)}近離場影響</div>` : ''}
     <div class="meta">空域最近點 ${esc(fmtCoord(a.p))}</div></div>`).join('');
 }
-const airportText = (a) => `距${a.name}（${a.icao}）RWY ${a.rwy} 跑道頭 ${fmtNm(a)}${inApproach(a) ? `，受${a.name}近離場影響` : ''}`;
+
+// ═══════════════════════════════════════════════════════════════
+// 縣市／鄉鎮／海岸線（內政部鄉鎮市區界線，簡化至約 10 公尺）
+// 跨縣市或跨海岸線的空域，每一塊都算一個空域；每個專案最多 5 個
+// ═══════════════════════════════════════════════════════════════
+const MAX_AIRSPACES = 5;
+const MIN_PIECE_RATIO = 0.01;   // 小於空域面積 1% 或 1000 m² 的邊界誤差不算
+const MIN_PIECE_M2 = 1000;
+let townData = [];
+async function loadTowns() {
+  try {
+    const res = await fetch('data/tw_towns.geojson');
+    townData = (await res.json()).features.map((f) => ({ f, bbox: turf.bbox(f), county: f.properties.c, town: f.properties.t }));
+    state.airspaces.forEach(refreshDerived);
+    save();
+    renderPanel();
+  } catch (err) { console.warn('鄉鎮界線載入失敗', err); }
+}
+function updateRegions(as) {
+  if (!townData.length) return;
+  const feat = asFeature(as);
+  const total = turf.area(feat);
+  const [w0, s0, e0, n0] = turf.bbox(feat);
+  const minPiece = Math.max(MIN_PIECE_M2, total * MIN_PIECE_RATIO);
+  const counties = new Map(); // 縣市 → 面積
+  let land = 0; let main = null;
+  for (const t of townData) {
+    const [w1, s1, e1, n1] = t.bbox;
+    if (w1 > e0 || e1 < w0 || s1 > n0 || n1 < s0) continue;
+    let inter = null;
+    try { inter = turf.intersect(turf.featureCollection([feat, t.f])); } catch { /* 幾何異常略過 */ }
+    if (!inter) continue;
+    const a = turf.area(inter);
+    land += a;
+    counties.set(t.county, (counties.get(t.county) || 0) + a);
+    if (!main || a > main.a) main = { a, county: t.county, town: t.town };
+  }
+  const countyList = [...counties.entries()].filter(([, a]) => a >= minPiece).sort((x, y) => y[1] - x[1]).map(([c]) => c);
+  const sea = total - land >= minPiece;
+  const hasLand = countyList.length > 0;
+  ui.regions[as.id] = {
+    counties: countyList, sea, hasLand,
+    count: Math.max(1, countyList.length + (sea && hasLand ? 1 : 0)),
+    main: main && { county: main.county, town: main.town },
+  };
+  // 地點自動帶入面積最大的鄉鎮（使用者手動改過就不動）
+  if (main && (as.areaAuto !== false || !as.area)) {
+    as.area = `${main.county}${main.town}`;
+    as.areaAuto = true;
+  }
+}
+const regionCount = (as) => ui.regions[as.id]?.count || 1;
+const overLimit = () => totalRegionCount() > MAX_AIRSPACES;
+const totalRegionCount = () => state.airspaces.reduce((s, as) => s + regionCount(as), 0);
+function regionHtml(as) {
+  const r = ui.regions[as.id];
+  if (!r || r.count <= 1) return '';
+  const why = [r.counties.length > 1 ? `跨縣市（${r.counties.map(esc).join('、')}）` : '', r.sea && r.hasLand ? '跨海岸線' : ''].filter(Boolean).join('、');
+  return `<div class="notice danger">⚠️ 此空域${why}，計為 <b>${r.count} 個空域</b>，建議依縣市／海岸線拆開繪製</div>`;
+}
+function airspaceCountHtml() {
+  const n = totalRegionCount();
+  const over = n > MAX_AIRSPACES;
+  return `<div class="notice ${over ? 'danger' : 'info'}">空域數：<b>${n} / ${MAX_AIRSPACES}</b>${n !== state.airspaces.length ? `（共 ${state.airspaces.length} 塊，跨縣市或跨海岸線的會計為多個）` : ''}
+    ${over ? `<br>⚠️ 超過每個專案 ${MAX_AIRSPACES} 個空域的上限，請刪除或調整空域後才能繼續` : ''}</div>`;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // 地圖
@@ -669,6 +765,7 @@ function deleteVertex(as, idx) {
 
 // 空域幾何變動後重算：限制區重疊、機場距離、最大地表高度
 function refreshDerived(as) {
+  updateRegions(as);
   updateWarnings(as);
   updateAirports(as);
   refreshElevation(as);
@@ -726,6 +823,7 @@ function updateHint() {
   hint.textContent = text;
 }
 function startDraw(type) {
+  if (totalRegionCount() >= MAX_AIRSPACES) { toast(`每個專案最多 ${MAX_AIRSPACES} 個空域（跨縣市或跨海岸線的空域會計為多個）`, 'error'); return; }
   ui.selectedAirspaceId = null;
   ui.draw = { points: [], center: null, mouse: null };
   setMode(type === 'polygon' ? 'drawPolygon' : 'drawCircle');
@@ -860,12 +958,13 @@ async function importKmlFile(file) {
   } catch (err) { toast(`無法讀取 ${file.name}：${err.message}`, 'error'); return; }
 
   if (ui.mode !== 'none') cancelMode();
-  const added = []; const notes = []; const points = [];
+  const added = []; const notes = []; const points = []; let skipped = 0;
   for (const pm of kmlEls(doc, 'Placemark')) {
     const name = kmlChild(pm, 'name')?.textContent.trim() || '';
     const meta = kmlExtendedData(pm);
     const polys = kmlEls(pm, 'Polygon');
     polys.forEach((poly, k) => {
+      if (state.airspaces.length >= MAX_AIRSPACES) { skipped += 1; return; }
       const outer = kmlEls(poly, 'outerBoundaryIs')[0] || poly;
       const coords = kmlEls(outer, 'coordinates')[0];
       const res = coords && ringToAirspace(parseKmlCoords(coords.textContent), meta);
@@ -888,7 +987,8 @@ async function importKmlFile(file) {
       if (pt) points.push({ lat: pt[0], lng: pt[1], name: name.replace(/^起飛點\s*\d+-\d+\s*/, '').trim() });
     }
   }
-  if (!added.length) { toast(`${file.name} 裡沒有找到多邊形空域`, 'error'); return; }
+  if (skipped) notes.push(`已達每個專案 ${MAX_AIRSPACES} 個空域上限，有 ${skipped} 個空域未匯入`);
+  if (!added.length) { toast(skipped ? notes[0] : `${file.name} 裡沒有找到多邊形空域`, 'error'); return; }
 
   let lpCount = 0;
   for (const p of points) {
@@ -913,7 +1013,7 @@ async function fillAreaName(as) {
   try {
     const [lat, lng] = asCenter(as);
     const j = await reverseGeocode(lat, lng);
-    if (j.area && !as.area) { as.area = j.area; save(); renderPanel(); }
+    if (j.area && !as.area) { as.area = j.area; as.areaAuto = true; save(); renderPanel(); }
   } catch { /* 使用者可手動填 */ }
 }
 
@@ -1211,12 +1311,23 @@ function buildLaunchText() {
   });
   return lines.join('\n');
 }
-// 已有【預計起飛地點】段落就整段取代（到下一個空白行為止），否則附加在最後
+// 作業概述格式：第一段 →【預計起飛地點】→ 結語
+const CLOSING_LINE = '將遵循所有規定並加強安全控管';
+// 起飛點段落 = 標題行，加上後面「以：結尾的空域行」或「全形空白開頭的起飛點行」
+const LAUNCH_BLOCK_RE = /【預計起飛地點】[^\n]*(?:\n(?:　[^\n]*|[^\n]*：[ \t]*))*/;
 function mergeLaunchText(overview) {
   const block = buildLaunchText();
-  const re = /【預計起飛地點】[^\n]*(?:\n[^\n]*\S[^\n]*)*/;
-  if (re.test(overview)) return overview.replace(re, block);
-  return overview.trim() ? `${overview.trimEnd()}\n\n${block}` : block;
+  if (LAUNCH_BLOCK_RE.test(overview)) return overview.replace(LAUNCH_BLOCK_RE, block);
+  const text = overview.trimEnd();
+  const idx = text.lastIndexOf(CLOSING_LINE);
+  if (idx >= 0) return `${text.slice(0, idx).trimEnd()}\n${block}\n${text.slice(idx)}`;
+  return text ? `${text}\n${block}\n${CLOSING_LINE}` : `${block}\n${CLOSING_LINE}`;
+}
+function composeOverview(intro) {
+  const parts = [intro.trim()];
+  if (state.launchPoints.length) parts.push(buildLaunchText());
+  parts.push(CLOSING_LINE);
+  return parts.join('\n');
 }
 function insertLaunchIntoOverview() {
   if (!state.launchPoints.length) { toast('目前沒有起飛點', 'error'); return; }
@@ -1232,16 +1343,16 @@ function insertLaunchIntoOverview() {
 const ANTHROPIC_SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk/+esm';
 const AI_MODEL = 'claude-opus-5-5';
 const API_KEY_STORAGE = 'caaDroneApp.apiKey';
-const AI_SYSTEM_PROMPT = `你是協助台灣無人機業者撰寫「交通部民用航空局 遙控無人機活動申請」文件的專業文書助理。
-使用者會提供案名、作業大致內容，以及系統自動整理的空域資料。請把大致內容擴寫成一份正式、完整、可直接貼進申請書的「作業概述」。
+const AI_SYSTEM_PROMPT = `你是協助台灣無人機業者撰寫「交通部民用航空局 遙控無人機活動申請」作業概述的文書助理。
+請依使用者提供的大致內容，寫出作業概述的第一段。格式固定如下，只輸出這一段：
 
-撰寫要求：
-1. 使用台灣正體中文與公文書常用語氣，條理分明。
-2. 以「一、二、三…」分段，建議包含：作業目的、作業地點及空域範圍、作業期間及時段、飛航高度、作業方式及飛行規劃、人員配置與安全管理措施、緊急應變措施。可依內容增減，但不要灌水。
-3. 只能使用使用者與空域資料中的事實。日期、時段、機型、操作人員證號、保險等未提供的資訊，一律寫成【待確認：項目】佔位，絕對不要自行編造。
-4. 不要寫「預計起飛地點」段落（系統會另外插入）；若已提供起飛點資料，可在作業方式中簡要提及「詳見預計起飛地點」。
-5. 輸出純文字，不要使用 Markdown 符號（#、*、**、- 項目符號、表格），因為內容會直接輸出成 Word。
-6. 直接輸出作業概述本文，不要前言或結語說明。`;
+本案係辦理「片名」紀錄片，受委託單位委託，拍攝規劃與內容。因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。
+
+規則：
+1. 「片名」、「委託單位」、「拍攝規劃與內容」依大致內容填入。拍攝規劃與內容用一到三句通順的公文語氣，說明拍攝主題、場景與方式，可提及作業地點。
+2. 大致內容沒有提供的資訊（例如片名或委託單位）寫成【待確認：項目】，不要自行編造。
+3. 最後一句「因素材拍攝範圍廣，須執行人群聚集或室外集會遊行上空活動、視距外操作及夜間飛行等操作限制。」照原文保留。
+4. 使用台灣正體中文，只輸出這一段純文字：不要標題、不要換行、不要 Markdown、不要其他說明。`;
 
 function getApiKey() {
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch { return ''; }
@@ -1252,29 +1363,14 @@ function setApiKey(key) {
   } catch { toast('此瀏覽器無法儲存金鑰（可能是無痕模式）', 'error'); }
 }
 
+// 給 AI 的空域資料只有名稱與地點（高度、機場距離等不帶入作業概述）
 function airspaceSummary() {
-  return state.airspaces.map((as) => {
-    const lines = [`${as.name}`, `  地點：${as.area || '未填'}`];
-    if (as.type === 'circle') lines.push(`  範圍：圓形，圓心 ${fmtCoord(as.center)}，半徑 ${Math.round(as.radius)} 公尺`);
-    else lines.push(`  範圍：多邊形 ${as.points.length} 點，頂點 ${as.points.map(fmtCoord).join('；')}`);
-    lines.push(`  面積：約 ${(asArea(as) / 1e4).toFixed(2)} 公頃`);
-    if (elevReady(as)) {
-      lines.push(`  空域內最大地表高度：${as.elev.ft} 英尺（${as.elev.m} 公尺）`);
-      lines.push(`  最低可申請高度：${minApplyFt(as)} 英尺`);
-    }
-    (ui.airports[as.id] || []).forEach((a) => lines.push(`  鄰近機場：空域最近點${airportText(a)}`));
-    const w = ui.warnings[as.id];
-    if (w?.zones.length) lines.push(`  與民航局公告限制區重疊：${w.zones.join('、')}`);
-    const pts = lpsOf(as.id);
-    if (pts.length) lines.push(`  預計起飛點：${pts.map((p) => p.name).join('、')}`);
-    return lines.join('\n');
-  }).join('\n');
+  return state.airspaces.map((as) => `${as.name}：${as.area || '未填地點'}`).join('\n');
 }
 async function runAiExpand() {
   if (!getApiKey()) { toast('請先在上方設定 Claude API 金鑰', 'error'); return; }
   if (!state.draft.trim()) { toast('請先輸入作業大致內容', 'error'); return; }
-  if (state.overview.trim() && !confirm('作業概述已有內容，AI 生成會覆蓋（起飛點段落會保留）。確定繼續？')) return;
-  const hadLaunch = state.overview.includes(LAUNCH_SECTION_TITLE);
+  if (state.overview.trim() && !confirm('作業概述已有內容，AI 生成會覆蓋（起飛點段落會依最新資料重新放入）。確定繼續？')) return;
   ui.aiBusy = true;
   renderPanel();
   const ta = () => document.querySelector('[data-field="overview"]');
@@ -1282,7 +1378,7 @@ async function runAiExpand() {
   try {
     ({ default: Anthropic } = await import(ANTHROPIC_SDK_URL));
     const client = new Anthropic({ apiKey: getApiKey(), dangerouslyAllowBrowser: true });
-    const userMsg = `案名：${state.caseName || '【待確認：案名】'}\n\n作業大致內容：\n${state.draft}\n\n空域資料（系統自動整理）：\n${airspaceSummary() || '（無）'}`;
+    const userMsg = `案名：${state.caseName || '【待確認：案名】'}\n\n作業大致內容：\n${state.draft}\n\n作業地點：\n${airspaceSummary() || '（無）'}`;
     const stream = client.beta.messages.stream({
       model: AI_MODEL,
       max_tokens: 16000,
@@ -1302,8 +1398,7 @@ async function runAiExpand() {
     const final = await stream.finalMessage();
     if (final.stop_reason === 'refusal') text += '\n\n【AI 拒絕產生此內容，請修改大致內容後再試】';
     else if (final.stop_reason === 'max_tokens') text += '\n\n【內容過長被截斷】';
-    state.overview = text.trim();
-    if (hadLaunch && state.launchPoints.length) state.overview = mergeLaunchText(state.overview);
+    state.overview = composeOverview(text);
     toast('AI 已完成作業概述，可直接修改', 'ok');
   } catch (err) {
     let msg = err.message;
@@ -1349,8 +1444,6 @@ function buildKml(airspaces, includeLaunch, docName) {
     const coords = ccw.map(([lng, lat]) => `${lng.toFixed(7)},${lat.toFixed(7)},0`).join(' ');
     const desc = [
       `地點：${as.area || ''}`,
-      elevReady(as) ? `最大地表高度：${as.elev.ft} ft（${as.elev.m} m）<br>最低可申請高度：${minApplyFt(as)} ft` : '',
-      ...(ui.airports[as.id] || []).map((a) => `空域最近點${airportText(a)}`),
       as.type === 'circle' ? `圓形：圓心 ${fmtCoord(as.center)}，半徑 ${Math.round(as.radius)} 公尺` : `多邊形頂點：${as.points.map(fmtCoord).join('；')}`,
     ].filter(Boolean).join('<br>');
     return `
@@ -1360,7 +1453,6 @@ function buildKml(airspaces, includeLaunch, docName) {
       <styleUrl>#as${i}</styleUrl>
       <ExtendedData>
         <Data name="地點"><value>${xmlEsc(as.area)}</value></Data>
-        ${elevReady(as) ? `<Data name="最大地表高度_ft"><value>${as.elev.ft}</value></Data><Data name="最低可申請高度_ft"><value>${minApplyFt(as)}</value></Data>` : ''}
         <Data name="形狀"><value>${as.type === 'circle' ? '圓形' : '多邊形'}</value></Data>
         ${as.type === 'circle' ? `<Data name="半徑_公尺"><value>${Math.round(as.radius)}</value></Data>` : ''}
         <Data name="CKWT座標"><value>${xmlEsc(ckwtList(as))}</value></Data>
@@ -1397,6 +1489,40 @@ async function exportKml() {
   }
   if (state.airspaces.length > 1) toast(`已輸出 ${state.airspaces.length} 個 KML 檔（瀏覽器若詢問「允許下載多個檔案」請按允許）`, 'ok');
 }
+// PDF：以列印版面開啟系統列印視窗，選「另存為 PDF」（文字可選取、檔案小，不需另外載入中文字型）
+const DOC_SECTION_RE = /^([一二三四五六七八九十]+、|【)/;
+function exportPdf() {
+  if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
+  const caseName = state.caseName.trim() || '未命名案件';
+  const fileTitle = `${safeName(caseName)}_作業概述`;
+  const body = state.overview.replace(/\r\n/g, '\n').trim().split('\n')
+    .map((line) => `<p class="${DOC_SECTION_RE.test(line.trim()) ? 'sec' : ''}">${esc(line) || '&nbsp;'}</p>`).join('');
+  const html = `<!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><title>${esc(fileTitle)}</title><style>
+    @page { size: A4; margin: 25mm; }
+    body { font-family: "BiauKai", "DFKai-SB", "標楷體", "Kaiti TC", "STKaiti", serif; font-size: 12pt; line-height: 1.5; color: #000; margin: 0; }
+    h1 { text-align: center; font-size: 18pt; margin: 0 0 18pt; }
+    .label { font-size: 14pt; font-weight: bold; margin: 0; }
+    .label span { font-weight: normal; }
+    p { margin: 0; white-space: pre-wrap; }
+    .sec { font-weight: bold; }
+  </style></head><body>
+    <h1>${esc(caseName)}</h1>
+    <p class="label">案名：<span>${esc(caseName)}</span></p>
+    <p class="label" style="margin-top:12pt">作業概述：</p>
+    ${body}
+  </body></html>`;
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
+  document.body.appendChild(iframe);
+  const pageTitle = document.title;
+  iframe.onload = () => {
+    document.title = fileTitle; // 部分瀏覽器用主頁標題當 PDF 預設檔名
+    iframe.contentWindow.addEventListener('afterprint', () => { document.title = pageTitle; setTimeout(() => iframe.remove(), 500); });
+    iframe.contentWindow.focus();
+    iframe.contentWindow.print();
+  };
+  iframe.srcdoc = html;
+}
 async function exportWord() {
   if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
   try {
@@ -1405,10 +1531,9 @@ async function exportWord() {
     const font = { ascii: '標楷體', eastAsia: '標楷體', hAnsi: '標楷體', cs: '標楷體' };
     const run = (text, sizePt, bold = false) => new d.TextRun({ text, bold, size: sizePt * 2, font });
     // 「一、」「【預計起飛地點】」這類段落標題加粗，其餘照原文換行輸出
-    const sectionRe = /^([一二三四五六七八九十]+、|【)/;
     const body = state.overview.replace(/\r\n/g, '\n').trim().split('\n').map((line) => new d.Paragraph({
       spacing: { line: 360, after: 0 },
-      children: [run(line, 12, sectionRe.test(line.trim()))],
+      children: [run(line, 12, DOC_SECTION_RE.test(line.trim()))],
     }));
     const margin = d.convertMillimetersToTwip(25);
     const doc = new d.Document({
@@ -1447,6 +1572,7 @@ function resetView() {
   ui.candidates = {};
   ui.warnings = {};
   ui.airports = {};
+  ui.regions = {};
   ui.selectedAirspaceId = null;
   ui.selectedLaunchId = null;
   state.airspaces.forEach(refreshDerived);
@@ -1465,6 +1591,7 @@ function fitAll() {
 // ═══════════════════════════════════════════════════════════════
 function goStep(n, force = false) {
   if (n > 1 && !state.airspaces.length) { toast('請先繪製至少一個空域', 'error'); n = 1; }
+  if (!force && n > state.step && overLimit()) { toast(`空域數超過 ${MAX_AIRSPACES} 個上限，請先調整空域`, 'error'); return; }
   if (!force && n === state.step) return;
   if (ui.mode !== 'none') cancelMode();
   state.step = n;
@@ -1537,6 +1664,7 @@ function airspaceInfoHtml(as) {
          <div class="meta">圓心 <span class="coord">${esc(fmtCoord(as.center))}</span></div>`
       : `<div class="meta">多邊形 ${as.points.length}/${MAX_POLY_POINTS} 點</div>`}
     <div class="meta">面積約 ${(area / 1e4).toFixed(2)} 公頃（${Math.round(area).toLocaleString()} m²）</div>
+    ${regionHtml(as)}
     ${elevationHtml(as)}
     ${airportHtml(as)}
     ${w.kinks ? '<div class="notice danger">⚠️ 多邊形邊線交錯，請拖曳頂點修正</div>' : ''}
@@ -1577,12 +1705,20 @@ function renderStep1() {
         <button class="btn ghost small" data-action="draw-undo" ${n ? '' : 'disabled'}>↶ 復原上一點</button>
       </div></div>` : ''}
     ${ui.mode === 'drawCircle' ? '<div class="notice info">先點圓心，再點一下決定半徑；完成後可在下方輸入精確半徑或拖曳方形把手。</div>' : ''}
+    ${state.airspaces.length ? airspaceCountHtml() : ''}
     ${cards || '<div class="empty">尚未建立空域<br>點上方「畫多邊形」或「畫圓形」開始</div>'}
   </div>
   ${footer(
-    `<button class="btn ghost" data-action="export-kml" ${state.airspaces.length ? '' : 'disabled'}>⬇ 輸出 KML</button>`,
-    `<button class="btn" data-action="next" ${state.airspaces.length ? '' : 'disabled'}>下一步：案名與作業概述 →</button>`,
+    `<button class="btn ghost" data-action="export-kml" ${state.airspaces.length && !overLimit() ? '' : 'disabled'}>⬇ 輸出 KML</button>`,
+    `<button class="btn" data-action="next" ${state.airspaces.length && !overLimit() ? '' : 'disabled'}>下一步：案名與作業概述 →</button>`,
   )}`;
+}
+
+function caseNameOptionsHtml() {
+  return `<div class="inline case-options">
+      <label class="inline"><input type="checkbox" data-field="highAltitude" ${state.highAltitude ? 'checked' : ''}> 400 呎以上（案名加註 ${HIGH_ALT_SUFFIX}）</label>
+      ${state.caseNameAuto ? '<span class="meta">（依預設格式自動產生）</span>' : '<button class="btn ghost tiny" data-action="case-name-default">↻ 套用預設格式</button>'}
+    </div>`;
 }
 
 function renderStep2() {
@@ -1599,11 +1735,12 @@ function renderStep2() {
   return `<div class="panel-body">
     <div>
       <h2>步驟 2　案名與作業概述</h2>
-      <p class="lead">先輸入大致內容（目的、時間、方式…），再按 AI 擴充，系統會結合空域資料寫成正式的作業概述。缺少的資訊會以【待確認】標示。</p>
+      <p class="lead">先輸入大致內容（片名、委託單位、拍攝內容），按 AI 擴充後會依格式寫成：「本案係辦理「片名」紀錄片，受○○委託，…」＋【預計起飛地點】＋「將遵循所有規定並加強安全控管」。缺少的資訊會以【待確認】標示。</p>
     </div>
-    <label class="field">案名<input type="text" data-field="caseName" value="${esc(state.caseName)}" placeholder="例：115年宜蘭縣頭城海岸空拍作業"></label>
+    <label class="field">案名<input type="text" data-field="caseName" value="${esc(state.caseName)}"></label>
+    ${caseNameOptionsHtml()}
     <label class="field">作業大致內容
-      <textarea data-field="draft" rows="6" placeholder="例：受宜蘭縣政府委託，於11月期間拍攝頭城海岸線宣傳影片，使用 DJI Mavic 3，每日上午 9 點到下午 4 點，預計飛行 5 天…">${esc(state.draft)}</textarea>
+      <textarea data-field="draft" rows="6" placeholder="例：片名「山海之間」，受宜蘭縣政府委託，拍攝頭城海岸、龜山島與五結鄉的自然景觀和在地生活…">${esc(state.draft)}</textarea>
     </label>
     ${aiNote}
     <div class="btn-row">
@@ -1714,6 +1851,7 @@ function renderStep4() {
     </div>
     ${outsideCount ? `<div class="notice danger">⚠️ 有 ${outsideCount} 個起飛點在空域外，請拖曳修正。</div>` : ''}
     <label class="field">案名<input type="text" data-field="caseName" value="${esc(state.caseName)}"></label>
+    ${caseNameOptionsHtml()}
     <label class="field">作業概述
       <textarea class="overview" data-field="overview">${esc(state.overview)}</textarea>
     </label>
@@ -1727,8 +1865,9 @@ function renderStep4() {
   </div>
   ${footer(
     '<button class="btn ghost" data-action="prev">← 上一步</button>',
-    `<button class="btn ghost" data-action="export-kml">🗺 輸出 KML</button>
-     <button class="btn" data-action="export-word">📄 輸出 Word</button>`,
+    `<button class="btn ghost" data-action="export-kml" ${overLimit() ? 'disabled' : ''}>🗺 輸出 KML</button>
+     <button class="btn ghost" data-action="export-pdf" ${overLimit() ? 'disabled' : ''}>📑 輸出 PDF</button>
+     <button class="btn" data-action="export-word" ${overLimit() ? 'disabled' : ''}>📄 輸出 Word</button>`,
   )}`;
 }
 
@@ -1739,8 +1878,14 @@ panelEl.addEventListener('input', (e) => {
   if (t.dataset.field) {
     const key = t.dataset.field;
     state[key] = t.type === 'checkbox' ? t.checked : t.value;
+    if (key === 'caseName') state.caseNameAuto = false;
+    if (key === 'highAltitude' && !state.caseNameAuto) {
+      // 手動改過的案名：只加上或拿掉結尾的 (高空)
+      const base = state.caseName.trimEnd().replace(/\(高空\)$/, '').trimEnd();
+      state.caseName = state.highAltitude ? `${base}${HIGH_ALT_SUFFIX}` : base;
+    }
     save();
-    if (key === 'coordFormat') { renderPanel(); }
+    if (key === 'coordFormat' || key === 'highAltitude') renderPanel();
     return;
   }
   if (t.dataset.asField) {
@@ -1752,6 +1897,7 @@ panelEl.addEventListener('input', (e) => {
       if (r >= 10) { as.radius = r; shapeById[as.id]?.setRadius(r); renderEditHandles(); }
     } else {
       as[f] = t.value;
+      if (f === 'area') as.areaAuto = false;
     }
     save();
     return;
@@ -1777,6 +1923,7 @@ panelEl.addEventListener('change', (e) => {
     }
     renderAirspaces();
     renderLaunch();
+    if (t.dataset.asField === 'area') renderPanel();
   }
   if (t.dataset.lpField) renderLaunch();
 });
@@ -1879,6 +2026,12 @@ function handleAction(action, data, btn) {
       break;
     case 'export-kml': exportKml(); break;
     case 'export-word': exportWord(); break;
+    case 'export-pdf': exportPdf(); break;
+    case 'case-name-default':
+      state.caseNameAuto = true;
+      save();
+      renderPanel();
+      break;
     case 'copy':
       navigator.clipboard.writeText(data.text).then(() => toast('已複製', 'ok'), () => toast('複製失敗', 'error'));
       break;
@@ -1920,4 +2073,5 @@ $('#mapSearch').addEventListener('submit', async (e) => {
   fitAll();
   loadCaaZones();
   loadRunways();
+  loadTowns();
 })();
