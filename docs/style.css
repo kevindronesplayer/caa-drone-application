@@ -226,7 +226,12 @@ table.data th { color: var(--muted); font-weight: 600; white-space: nowrap; }
 details.notice summary { cursor: pointer; font-weight: 600; }
 details.notice[open] summary { margin-bottom: 4px; }
 .stat { font-size: 13px; line-height: 1.6; }
-.peak-icon { color: #6d4c41; font-size: 14px; margin: -10px 0 0 -6px; text-shadow: 0 0 2px #fff, 0 0 2px #fff; }
+.peak-icon {
+  color: #d84315; font-size: 22px; line-height: 1; width: 22px; text-align: center; margin: -15px 0 0 -11px;
+  text-shadow: 0 0 2px #fff, 0 0 3px #fff, 0 0 4px #fff;
+}
+.leaflet-tooltip.peak-label { background: #d84315; color: #fff; border: none; box-shadow: 0 1px 3px rgba(0,0,0,.3); font-weight: 700; font-size: 12px; padding: 1px 6px; }
+.leaflet-tooltip.peak-label::before { display: none; }
 .leaflet-tooltip.dist-label { background: #c62828; color: #fff; border: none; font-weight: 700; font-size: 12px; padding: 1px 6px; }
 .leaflet-tooltip.dist-label::before { display: none; }
 .map-wrap.drop-hover::after {

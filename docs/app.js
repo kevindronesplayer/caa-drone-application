@@ -695,8 +695,9 @@ function renderElevation() {
     if (!elevReady(as)) return;
     L.marker([ev.lat, ev.lng], {
       icon: L.divIcon({ className: '', html: '<div class="peak-icon">▲</div>', iconSize: [0, 0] }),
-      interactive: true, keyboard: false,
-    }).bindTooltip(`${as.name} 最大地表高度 約 ${ev.ft.toLocaleString()} ft（${ev.m} m）`, { direction: 'top' }).addTo(elevGroup);
+      keyboard: false, zIndexOffset: 600,
+    }).bindTooltip(`最高點 ${ev.ft.toLocaleString()} ft`, { permanent: true, direction: 'right', offset: [8, -2], className: 'peak-label' })
+      .addTo(elevGroup);
   });
 }
 // 空域最近點 → 跑道頭的距離線
