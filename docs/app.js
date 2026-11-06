@@ -1567,16 +1567,26 @@ function exportPdf() {
   const caseName = state.caseName.trim() || '未命名案件';
   const fileTitle = `${safeName(caseName)}_作業概述`;
   state.overview = ensureClosing(state.overview);
-  const body = state.overview.trim().split('\n')
-    .map((line) => `<p class="${DOC_SECTION_RE.test(line.trim()) ? 'sec' : ''}">${esc(line) || '&nbsp;'}</p>`).join('');
+  const lines = ['作業概述', ...state.overview.trim().split('\n')];
+  const rows = lines.map((line, i) => `<tr><td><p class="${i === 0 || DOC_SECTION_RE.test(line.trim()) ? 'sec' : ''}">${esc(line) || '&nbsp;'}</p></td></tr>`).join('');
+  // 頁面邊界設為 0，瀏覽器就不會印出日期、標題、網址等頁首頁尾；
+  // 上下 25mm 留白改用表格的 thead／tfoot（每頁都會重複），左右用 padding
   const html = `<!doctype html><html lang="zh-Hant-TW"><head><meta charset="utf-8"><title>${esc(fileTitle)}</title><style>
-    @page { size: A4; margin: 25mm; }
-    body { font-family: "BiauKai", "DFKai-SB", "標楷體", "Kaiti TC", "STKaiti", serif; font-size: 12pt; line-height: 1.5; color: #000; margin: 0; }
+    @page { size: A4; margin: 0; }
+    html, body { margin: 0; }
+    body { padding: 0 25mm; font-family: "BiauKai", "DFKai-SB", "標楷體", "Kaiti TC", "STKaiti", serif; font-size: 12pt; line-height: 1.5; color: #000; }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: 0; }
+    .space { height: 25mm; }
+    tr { break-inside: avoid; }
     p { margin: 0; white-space: pre-wrap; }
     .sec { font-weight: bold; }
   </style></head><body>
-    <p class="sec">作業概述</p>
-    ${body}
+    <table>
+      <thead><tr><td><div class="space"></div></td></tr></thead>
+      <tfoot><tr><td><div class="space"></div></td></tr></tfoot>
+      <tbody>${rows}</tbody>
+    </table>
   </body></html>`;
   const iframe = document.createElement('iframe');
   iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;';
