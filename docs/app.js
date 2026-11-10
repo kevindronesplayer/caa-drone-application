@@ -5,6 +5,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const MAX_POLY_POINTS = 6;
+const STEP = { DRAW: 1, LAUNCH: 2, OVERVIEW: 3, EXPORT: 4 };
 const STORAGE_KEY = 'caaDroneApp.v1';
 const AS_COLOR = '#7b1fa2'; // 所有空域統一紫色
 const LAUNCH_SECTION_TITLE = '【預計起飛地點】';
@@ -22,7 +23,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 // ── 狀態 ──────────────────────────────────────────────────────
 function newState() {
   return {
-    version: 4, step: 1, caseName: '', caseNameAuto: true, highAltitude: false, overview: DEFAULT_OVERVIEW,
+    version: 5, step: 1, caseName: '', caseNameAuto: true, highAltitude: false, overview: DEFAULT_OVERVIEW,
     coordFormat: 'decimal',
     airspaces: [], launchPoints: [], seq: 1, asSeq: 1,
   };
@@ -50,6 +51,10 @@ function migrate(s) {
     delete s.draft;
     delete s.includeLaunchInKml;
     s.version = 4;
+  }
+  if (s.version < 5) { // v5：步驟 2、3 對調（起飛點在作業概述之前）
+    if (s.step === 2) s.step = 3; else if (s.step === 3) s.step = 2;
+    s.version = 5;
   }
   s.overview = ensureClosing(s.overview || ''); // 結語一定在最後一行
   return s;
@@ -674,7 +679,7 @@ function renderAirspaces() {
     shape.bindTooltip(as.name, { sticky: true });
     shape.on('click', (e) => {
       if (ui.mode !== 'none') return;
-      if (state.step === 1 || state.step === 4) {
+      if (state.step === STEP.DRAW || state.step === STEP.EXPORT) {
         L.DomEvent.stopPropagation(e);
         selectAirspace(as.id);
       }
@@ -722,7 +727,7 @@ const radiusIcon = L.divIcon({ className: '', html: '<div class="radius-icon"></
 function renderEditHandles() {
   editGroup.clearLayers();
   const as = getAs(ui.selectedAirspaceId);
-  if (!as || ui.mode !== 'none' || !(state.step === 1 || state.step === 4)) return;
+  if (!as || ui.mode !== 'none' || !(state.step === STEP.DRAW || state.step === STEP.EXPORT)) return;
   const shape = shapeById[as.id];
   if (!shape) return;
 
@@ -1089,7 +1094,7 @@ map.on('click', (e) => {
       return;
     }
     default:
-      if (ui.selectedAirspaceId && (state.step === 1 || state.step === 4)) {
+      if (ui.selectedAirspaceId && (state.step === STEP.DRAW || state.step === STEP.EXPORT)) {
         ui.selectedAirspaceId = null;
         renderAirspaces(); renderPanel();
       }
@@ -1289,7 +1294,7 @@ function moveLaunchPoint(lp, { lat, lng, name, kind, named }) {
 function selectLaunch(id) {
   ui.selectedLaunchId = id;
   ui.addFor = null;
-  setMode(state.step === 3 ? 'moveLaunch' : 'none');
+  setMode(state.step === STEP.LAUNCH ? 'moveLaunch' : 'none');
   requestAnimationFrame(() => document.querySelector(`[data-lp-row="${id}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
 }
 
@@ -1302,8 +1307,8 @@ function launchIcon(label, color, selected, outside) {
 }
 function renderLaunch() {
   launchGroup.clearLayers();
-  if (state.step < 3 && !state.launchPoints.length) return;
-  const editable = state.step >= 3 && !['drawPolygon', 'drawCircle'].includes(ui.mode);
+  if (state.step < STEP.LAUNCH && !state.launchPoints.length) return;
+  const editable = (state.step === STEP.LAUNCH || state.step === STEP.EXPORT) && !['drawPolygon', 'drawCircle'].includes(ui.mode);
   state.launchPoints.forEach((lp) => {
     const as = getAs(lp.airspaceId);
     if (!as) return;
@@ -1334,7 +1339,7 @@ function candIcon(kind) {
 }
 function renderCandidates() {
   candGroup.clearLayers();
-  if (state.step < 3) return;
+  if (state.step !== STEP.LAUNCH && state.step !== STEP.EXPORT) return;
   state.airspaces.forEach((as) => {
     const c = ui.candidates[as.id];
     if (!c || c.key !== geomKey(as)) return;
@@ -1564,8 +1569,7 @@ async function exportKml() {
 const DOC_SECTION_RE = /^([一二三四五六七八九十]+、|【)/;
 function exportPdf() {
   if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
-  const caseName = state.caseName.trim() || '未命名案件';
-  const fileTitle = `${safeName(caseName)}_作業概述`;
+  const fileTitle = '作業概述';
   state.overview = ensureClosing(state.overview);
   const lines = ['作業概述', ...state.overview.trim().split('\n')];
   const rows = lines.map((line, i) => `<tr><td><p class="${i === 0 || DOC_SECTION_RE.test(line.trim()) ? 'sec' : ''}">${esc(line) || '&nbsp;'}</p></td></tr>`).join('');
@@ -1604,7 +1608,6 @@ async function exportWord() {
   if (!state.overview.trim()) { toast('作業概述是空的', 'error'); return; }
   try {
     const d = await import(DOCX_URL);
-    const caseName = state.caseName.trim() || '未命名案件';
     const font = { ascii: '標楷體', eastAsia: '標楷體', hAnsi: '標楷體', cs: '標楷體' };
     const run = (text, sizePt, bold = false) => new d.TextRun({ text, bold, size: sizePt * 2, font });
     // 「一、」「【預計起飛地點】」這類段落標題加粗，其餘照原文換行輸出
@@ -1623,7 +1626,7 @@ async function exportWord() {
         ],
       }],
     });
-    download(await d.Packer.toBlob(doc), `${safeName(caseName)}_作業概述.docx`);
+    download(await d.Packer.toBlob(doc), '作業概述.docx');
   } catch (err) {
     toast(`Word 輸出失敗：${err.message}`, 'error');
   }
@@ -1672,15 +1675,16 @@ function goStep(n, force = false) {
   if (ui.mode !== 'none') cancelMode();
   state.step = n;
   ui.selectedLaunchId = null;
-  if (n !== 1 && n !== 4) ui.selectedAirspaceId = null;
-  state.overview = n === 4 && state.launchPoints.length ? mergeLaunchText(state.overview) : ensureClosing(state.overview);
+  if (n !== STEP.DRAW && n !== STEP.EXPORT) ui.selectedAirspaceId = null;
+  const pasteLaunch = (n === STEP.OVERVIEW || n === STEP.EXPORT) && state.launchPoints.length;
+  state.overview = pasteLaunch ? mergeLaunchText(state.overview) : ensureClosing(state.overview);
   save();
   renderAirspaces();
   renderLaunch();
   renderCandidates();
   renderPanel();
   $('#panel').scrollTop = 0;
-  if (n === 3) {
+  if (n === STEP.LAUNCH) {
     state.airspaces.forEach((as) => {
       if (!lpsOf(as.id).length) autoGenerate(as);
       else ensureCandidates(as);
@@ -1706,7 +1710,8 @@ function renderPanel() {
   const selStart = active?.selectionStart; const selEnd = active?.selectionEnd;
   const scroll = panel.scrollTop;
 
-  panel.innerHTML = [null, renderStep1, renderStep2, renderStep3, renderStep4][state.step]();
+  const renderers = { [STEP.DRAW]: renderDrawStep, [STEP.LAUNCH]: renderLaunchStep, [STEP.OVERVIEW]: renderOverviewStep, [STEP.EXPORT]: renderExportStep };
+  panel.innerHTML = renderers[state.step]();
 
   panel.scrollTop = scroll;
   if (focusKey) {
@@ -1748,7 +1753,7 @@ function airspaceInfoHtml(as) {
     ${w.zones.length ? `<details class="notice warn"><summary>⚠️ 與 ${w.zones.length} 處民航局公告限制區重疊（點開查看）</summary>${w.zones.map(esc).join('<br>')}</details>` : ''}`;
 }
 
-function renderStep1() {
+function renderDrawStep() {
   const drawing = ui.mode === 'drawPolygon' || ui.mode === 'drawCircle';
   const n = ui.draw?.points?.length || 0;
   const cards = state.airspaces.map((as) => `
@@ -1787,7 +1792,7 @@ function renderStep1() {
   </div>
   ${footer(
     `<button class="btn ghost" data-action="export-kml" ${state.airspaces.length && !overLimit() ? '' : 'disabled'}>⬇ 輸出 KML</button>`,
-    `<button class="btn" data-action="next" ${state.airspaces.length && !overLimit() ? '' : 'disabled'}>下一步：案名與作業概述 →</button>`,
+    `<button class="btn" data-action="next" ${state.airspaces.length && !overLimit() ? '' : 'disabled'}>下一步：預計起飛地點 →</button>`,
   )}`;
 }
 
@@ -1798,7 +1803,7 @@ function caseNameOptionsHtml() {
     </div>`;
 }
 
-function renderStep2() {
+function renderOverviewStep() {
   const hasKey = Boolean(getApiKey());
   const aiNote = hasKey
     ? `<details class="notice ok"><summary>✓ 已設定 Claude API 金鑰（只存在這個瀏覽器）</summary>
@@ -1811,8 +1816,8 @@ function renderStep2() {
          </div></div>`;
   return `<div class="panel-body">
     <div>
-      <h2>步驟 2　案名與作業概述</h2>
-      <p class="lead">在作業概述第一段填入片名（XX）、委託單位（XX）與拍攝規劃與內容，可按 AI 潤飾第一段；未填的部分會以【待確認】標示。【預計起飛地點】會在下一步貼入。</p>
+      <h2>步驟 3　案名與作業概述</h2>
+      <p class="lead">在作業概述第一段填入片名（XX）、委託單位（XX）與拍攝規劃與內容，可按 AI 潤飾第一段；未填的部分會以【待確認】標示。【預計起飛地點】已依上一步自動貼入。</p>
     </div>
     <label class="field">案名<input type="text" data-field="caseName" value="${esc(state.caseName)}"></label>
     ${caseNameOptionsHtml()}
@@ -1827,7 +1832,7 @@ function renderStep2() {
   </div>
   ${footer(
     '<button class="btn ghost" data-action="prev">← 上一步</button>',
-    '<button class="btn" data-action="next">下一步：預計起飛地點 →</button>',
+    '<button class="btn" data-action="next">下一步：確認與輸出 →</button>',
   )}`;
 }
 
@@ -1859,7 +1864,7 @@ function launchRowsHtml(as, compact = false) {
   }).join('') || '<div class="meta">尚無起飛點</div>';
 }
 
-function renderStep3() {
+function renderLaunchStep() {
   const groups = state.airspaces.map((as) => {
     const c = ui.candidates[as.id];
     const status = !c ? '' : c.loading ? '<span class="spinner"></span> 搜尋公園／停車場中…'
@@ -1880,7 +1885,7 @@ function renderStep3() {
 
   return `<div class="panel-body">
     <div>
-      <h2>步驟 3　預計起飛地點</h2>
+      <h2>步驟 2　預計起飛地點</h2>
       <p class="lead">每個空域自動產生 2 個起飛點：優先挑空域內<b>相距最遠</b>的公園或戶外停車場（離空域邊緣至少 20%），不足時用廟宇，再不足才用空域對角線上離邊緣約 25% 的位置。
       點選地圖上的起飛點後，再點新位置或候選點（🌳公園／P停車場／廟）即可修改，也可直接拖曳（拖到候選點旁會自動吸附）。</p>
     </div>
@@ -1889,19 +1894,18 @@ function renderStep3() {
     ${groups}
     ${coordFormatSelect()}
     <div class="card">
-      <h3>貼到作業概述的內容預覽</h3>
+      <h3>作業概述中的【預計起飛地點】預覽</h3>
       <pre class="preview">${esc(buildLaunchText())}</pre>
-      <button class="btn" data-action="lp-insert">📋 貼到作業概述</button>
-      <div class="meta">若作業概述已有【預計起飛地點】段落，會整段更新。</div>
+      <div class="meta">進入下一步時會自動貼到作業概述（已有此段落則整段更新）。</div>
     </div>
   </div>
   ${footer(
     '<button class="btn ghost" data-action="prev">← 上一步</button>',
-    '<button class="btn" data-action="next">下一步：確認與輸出 →</button>',
+    '<button class="btn" data-action="next">下一步：案名與作業概述 →</button>',
   )}`;
 }
 
-function renderStep4() {
+function renderExportStep() {
   const outsideCount = state.launchPoints.filter((lp) => { const as = getAs(lp.airspaceId); return as && !insideAirspace(as, lp.lat, lp.lng); }).length;
   const asCards = state.airspaces.map((as) => `
     <div class="card ${as.id === ui.selectedAirspaceId ? 'selected' : ''}" data-card="${as.id}">
